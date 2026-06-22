@@ -19,8 +19,10 @@ import streamlit as st
 from typing import Any, Dict
 import pandas as pd
 
-_HOST      = os.environ.get("DATABRICKS_HOST",         "").strip()
-_HTTP_PATH = os.environ.get("SQL_WAREHOUSE_HTTP_PATH", "").strip()
+# Hardcoded exactly like the billing-disputes app — avoids any timing issue
+# with module-level env var reads before Databricks sets them.
+DATABRICKS_HOST      = "homebase-staging.cloud.databricks.com"
+DATABRICKS_HTTP_PATH = "/sql/1.0/warehouses/16984dfe9a2c3705"
 
 
 def _user_token() -> str:
@@ -54,8 +56,8 @@ def run_query(sql_text: str) -> pd.DataFrame:
     # alongside the OAuth credentials (that causes the "two auth methods" conflict).
     cfg  = Config()
     conn = dbsql.connect(
-        server_hostname=cfg.host,
-        http_path=_HTTP_PATH,
+        server_hostname=DATABRICKS_HOST,
+        http_path=DATABRICKS_HTTP_PATH,
         credentials_provider=lambda: cfg.authenticate,
     )
     try:
