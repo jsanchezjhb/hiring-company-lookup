@@ -541,7 +541,7 @@ def check_dormancy_reactivation(company_id: int) -> Dict[str, Any]:
 #   prod_raw.stripe.charge                    — raw charge objects (disputed flag, fingerprint)
 #
 # Columns marked ✅ confirmed from SELECT * … LIMIT 1 output.
-# Columns marked ← VERIFY still need a quick check against the charge table.
+# Columns marked ← VERIFY still need a quick check.
 # ===========================================================================
 
 # Tables
@@ -549,63 +549,73 @@ _TXN_TABLE  = "prod_enriched.stripe.stripe_transactions"   # Signal 6
 _SUB_TABLE  = "prod_enriched.stripe.stripe_subscription"   # Signals 7, 8, 9 (company linkage)
 _CHG_TABLE  = "prod_raw.stripe.charge"                     # Signals 7, 8, 9
 
-# stripe_subscription columns — ✅ confirmed from schema output
+# stripe_subscription columns — ✅ confirmed
 _SUB_COMPANY_COL   = "company_id"          # ✅ confirmed
-_SUB_CUSTOMER_COL  = "biller_customer_id"  # ✅ confirmed (Stripe cus_* ID)
+_SUB_CUSTOMER_COL  = "biller_customer_id"  # ✅ confirmed (holds cus_* Stripe ID)
 
-# prod_raw.stripe.charge columns — ← VERIFY (charge LIMIT 1 not yet shared)
-# _CHARGE_CUSTOMER_COL : column on charge that holds the Stripe cus_* ID.
-#   Standard Stripe name is "customer" — check your flattened schema.
-_CHARGE_CUSTOMER_COL = "customer"          # ← VERIFY
+# prod_raw.stripe.charge columns — ✅ confirmed from charge LIMIT 1 output
+_CHARGE_CUSTOMER_COL = "customer"          # ✅ confirmed (holds cus_* Stripe ID)
+_CHARGE_PM_COL       = "payment_method"    # ✅ confirmed (holds pm_* Stripe ID)
 
-# Payment method ID column on prod_raw.stripe.charge (Signal 8).
-#   Standard Stripe name is "payment_method" — check your flattened schema.
-_CHARGE_PM_COL = "payment_method"          # ← VERIFY
+# Fingerprint lives inside the payment_method_details JSON column, not as a
+# flat column. Confirmed structure from charge schema:
+#   payment_method_details → {"card": {"fingerprint": "YJr2g3I1oY2K5Nms", ...}}
+# Signal 9 uses GET_JSON_OBJECT(c.payment_method_details, _FINGERPRINT_PATH)
+_FINGERPRINT_PATH = "'$.card.fingerprint'"  # ✅ confirmed path
 
-# Card fingerprint column on prod_raw.stripe.charge (Signal 9).
-#   In Stripe's flattened schema this is commonly one of:
-#     payment_method_details_card_fingerprint
-#     card_fingerprint
-#     fingerprint
-#   Run: SELECT * FROM prod_raw.stripe.charge LIMIT 1 and look for 'fingerprint'.
-_FINGERPRINT_COL = "payment_method_details_card_fingerprint"  # ← VERIFY
+# charge.created is a Unix epoch in SECONDS (e.g. 1659579357).
+# All charge queries use FROM_UNIXTIME(c.created) — NOT CAST(... AS TIMESTAMP).
+# (Subscription/transaction tables use ISO timestamps, so those stay as CAST.)
 
-# Company/location join column in stripe_transactions (Signal 6).
-_TXN_COMPANY_COL = "company_id"            # ← VERIFY
-
-# Status values that represent a failed payment in stripe_transactions.
-_FAILED_STATUSES = "('failed', 'payment_failed', 'uncollectible')"
+# stripe_transactions columns — ✅ confirmed from stripe_transactions LIMIT 1 output
+_TXN_COMPANY_COL    = "company_id"      # ✅ confirmed
+# Status column is status_name (not status). Confirmed values include 'paid'.
+# Non-paid rows are flagged as unsuccessful billing attempts.
+# ← If you want to narrow to a specific failed status (e.g. 'failed', 'open'),
+#   update the WHERE clause in check_failed_billing directly.
 
 # Alert threshold for payment method changes (Signal 8).
-_PM_THRESHOLD = 2                          # alert when distinct methods > this
+_PM_THRESHOLD = 2                       # alert when distinct methods > this
 
 
 # ---------------------------------------------------------------------------
 # Signal 6 — Failed / Unsuccessful Billing
 # ---------------------------------------------------------------------------
+#
+# Confirmed stripe_transactions columns:
+#   status_name     — 'paid' = success; anything else = unsuccessful
+#   transaction_at  — already an ISO timestamp, no conversion needed
+#   transaction_id  — Stripe event ID (evt_*)
+#   invoice_id      — Stripe invoice ID (in_*)
+#   subscription_uuid — internal subscription UUID
+#   company_id      — direct company filter ✅
+#   amount          — ← VERIFY units: enriched tables sometimes pre-convert
+#                       cents → dollars. Sample row showed 0 so units unclear.
+#                       If amounts look 100x too high, divide by 100 here.
+# ---------------------------------------------------------------------------
 
 def check_failed_billing(company_id: int) -> Dict[str, Any]:
     """
-    ALERT if the company has any failed payment attempts recorded in
-    prod_enriched.stripe.stripe_transactions.
+    ALERT if the company has any transactions in stripe_transactions where
+    status_name != 'paid' — indicating an unsuccessful billing attempt.
 
-    Amounts are stored in cents in Stripe → divided by 100 for display.
+    transaction_at is already a proper timestamp (no conversion needed).
     """
     sql = f"""
     SELECT
-        t.id                            AS transaction_id,
-        ROUND(t.amount / 100.0, 2)      AS amount_usd,
-        UPPER(t.currency)               AS currency,
-        t.status,
-        COALESCE(t.failure_code,    'n/a') AS failure_code,
-        COALESCE(t.failure_message, 'n/a') AS failure_message,
+        t.transaction_id,
         t.invoice_id,
-        t.subscription_id,
-        CAST(t.created AS TIMESTAMP)    AS charged_at
+        t.subscription_uuid,
+        t.status_name,
+        t.amount,                       -- ← VERIFY units (may already be dollars)
+        UPPER(t.currency)               AS currency,
+        t.sales_tax,
+        t.discount_applied,
+        t.transaction_at                AS charged_at
     FROM {_TXN_TABLE} t
     WHERE t.{_TXN_COMPANY_COL} = {company_id}
-      AND t.status IN {_FAILED_STATUSES}
-    ORDER BY t.created DESC
+      AND t.status_name != 'paid'
+    ORDER BY t.transaction_at DESC
     """
     try:
         df      = run_query(sql)
@@ -613,13 +623,17 @@ def check_failed_billing(company_id: int) -> Dict[str, Any]:
         flagged = count > 0
 
         if flagged:
-            total_usd = df["amount_usd"].sum() if "amount_usd" in df.columns else 0
-            msg = (
-                f"{count} failed billing attempt{'s' if count != 1 else ''} "
-                f"(total exposure: ${total_usd:,.2f})"
+            # Group by distinct status_name values for the summary line
+            status_breakdown = (
+                df["status_name"].value_counts().to_dict()
+                if "status_name" in df.columns else {}
             )
+            breakdown_str = "  |  ".join(
+                f"{v} '{k}'" for k, v in status_breakdown.items()
+            )
+            msg = f"{count} unsuccessful billing transaction{'s' if count != 1 else ''}: {breakdown_str}"
         else:
-            msg = "No failed billing attempts found"
+            msg = "No unsuccessful billing transactions found"
 
         return _result("ALERT" if flagged else "CLEAR", msg, df, count)
     except Exception as exc:
@@ -630,12 +644,9 @@ def check_failed_billing(company_id: int) -> Dict[str, Any]:
 # Signal 7 — Billing Disputes
 # ---------------------------------------------------------------------------
 #
-# In Stripe's data model, a disputed charge has disputed = true on the charge
-# object. We link company_id → Stripe customer via stripe_subscription, then
-# pull all charges for that customer where disputed is true.
-#
-# If your charge table uses a different column for disputes (e.g. dispute IS
-# NOT NULL, or amount_refunded > 0), adjust the WHERE clause below.
+# charge.disputed (boolean) ✅ confirmed in schema.
+# No amount_disputed column exists — we show the full charge amount.
+# charge.created is Unix seconds → FROM_UNIXTIME().
 # ---------------------------------------------------------------------------
 
 def check_billing_disputes(company_id: int) -> Dict[str, Any]:
@@ -643,10 +654,10 @@ def check_billing_disputes(company_id: int) -> Dict[str, Any]:
     ALERT if any Stripe charge linked to this company has been disputed.
 
     Join path: company_id → stripe_subscription.biller_customer_id → charge.customer
+    charge.disputed confirmed as a boolean column in the charge schema.
     """
     sql = f"""
     WITH company_customers AS (
-        -- Map the target company to its Stripe customer ID(s)
         SELECT DISTINCT {_SUB_CUSTOMER_COL} AS stripe_customer
         FROM {_SUB_TABLE}
         WHERE {_SUB_COMPANY_COL} = {company_id}
@@ -654,11 +665,12 @@ def check_billing_disputes(company_id: int) -> Dict[str, Any]:
     )
     SELECT
         c.id                                    AS charge_id,
-        ROUND(c.amount         / 100.0, 2)      AS charge_amount_usd,
-        ROUND(c.amount_disputed / 100.0, 2)     AS disputed_amount_usd,
+        ROUND(c.amount / 100.0, 2)              AS charge_amount_usd,
         UPPER(c.currency)                       AS currency,
         c.status                                AS charge_status,
-        CAST(c.created AS TIMESTAMP)            AS charged_at,
+        COALESCE(c.failure_code,    'n/a')      AS failure_code,
+        COALESCE(c.failure_message, 'n/a')      AS failure_message,
+        FROM_UNIXTIME(c.created)                AS charged_at,
         c.{_CHARGE_CUSTOMER_COL}                AS stripe_customer
     FROM {_CHG_TABLE} c
     INNER JOIN company_customers cc
@@ -672,13 +684,10 @@ def check_billing_disputes(company_id: int) -> Dict[str, Any]:
         flagged = count > 0
 
         if flagged:
-            disputed_usd = (
-                df["disputed_amount_usd"].sum()
-                if "disputed_amount_usd" in df.columns else 0
-            )
+            total_usd = df["charge_amount_usd"].sum() if "charge_amount_usd" in df.columns else 0
             msg = (
                 f"{count} disputed charge{'s' if count != 1 else ''} "
-                f"(total disputed: ${disputed_usd:,.2f})"
+                f"(total charge value: ${total_usd:,.2f})"
             )
         else:
             msg = "No billing disputes found"
@@ -720,8 +729,8 @@ def check_payment_method_changes(company_id: int) -> Dict[str, Any]:
         c.{_CHARGE_PM_COL}                      AS payment_method_id,
         COUNT(*)                                 AS times_charged,
         ROUND(SUM(c.amount) / 100.0, 2)          AS total_charged_usd,
-        MIN(CAST(c.created AS TIMESTAMP))        AS first_used_at,
-        MAX(CAST(c.created AS TIMESTAMP))        AS last_used_at
+        MIN(FROM_UNIXTIME(c.created))            AS first_used_at,
+        MAX(FROM_UNIXTIME(c.created))            AS last_used_at
     FROM {_CHG_TABLE} c
     INNER JOIN company_customers cc
       ON cc.stripe_customer = c.{_CHARGE_CUSTOMER_COL}
@@ -753,14 +762,16 @@ def check_payment_method_changes(company_id: int) -> Dict[str, Any]:
 # Signal 9 — Stripe Card Fingerprint Reuse Across Companies
 # ---------------------------------------------------------------------------
 #
-# Join path for both sides of the cross-company check:
-#   company_id  →  stripe_subscription.customer
-#              →  charge.customer
-#              →  charge.[_FINGERPRINT_COL]
+# Fingerprint confirmed as nested JSON (not a flat column):
+#   payment_method_details → {"card": {"fingerprint": "YJr2g3I1oY2K5Nms", ...}}
+#   Extracted with: GET_JSON_OBJECT(c.payment_method_details, '$.card.fingerprint')
 #
-# If _FINGERPRINT_COL doesn't exist in prod_raw.stripe.charge, run:
-#   SELECT * FROM prod_raw.stripe.charge LIMIT 1
-# and look for a column containing 'fingerprint'.
+# charge.created is Unix seconds → FROM_UNIXTIME().
+#
+# Join path for both sides of the cross-company check:
+#   company_id  →  stripe_subscription.biller_customer_id
+#              →  charge.customer
+#              →  GET_JSON_OBJECT(charge.payment_method_details, '$.card.fingerprint')
 # ---------------------------------------------------------------------------
 
 def check_fingerprint_reuse(company_id: int) -> Dict[str, Any]:
@@ -768,13 +779,12 @@ def check_fingerprint_reuse(company_id: int) -> Dict[str, Any]:
     ALERT if any Stripe card fingerprint used by this company also appears on
     charges belonging to one or more OTHER companies.
 
-    The same physical card (same fingerprint) funding multiple separate accounts
-    is a strong indicator of a fraud ring or bulk account creation.
-    Fingerprints are stable across card re-issues (new expiry / CVV), so a
-    match here is highly reliable.
+    The same physical card funding multiple separate accounts is a strong
+    indicator of a fraud ring or bulk account creation. Fingerprints are
+    stable across card re-issues (new expiry / CVV), so a match is highly reliable.
 
-    Join path: company_id → stripe_subscription.biller_customer_id
-                          → charge.customer → charge.[_FINGERPRINT_COL]
+    Fingerprint is extracted from the payment_method_details JSON column:
+      GET_JSON_OBJECT(payment_method_details, '$.card.fingerprint')
     """
     sql = f"""
     WITH target_customers AS (
@@ -784,16 +794,23 @@ def check_fingerprint_reuse(company_id: int) -> Dict[str, Any]:
         WHERE {_SUB_COMPANY_COL} = {company_id}
           AND {_SUB_CUSTOMER_COL} IS NOT NULL
     ),
-    target_fingerprints AS (
-        -- Every distinct card fingerprint ever charged to this company
+    target_charge_fps AS (
+        -- Extract fingerprint from JSON for all charges on this company
         SELECT
-            c.{_FINGERPRINT_COL}              AS fingerprint,
-            MIN(CAST(c.created AS TIMESTAMP)) AS first_used_on_this_account
+            GET_JSON_OBJECT(c.payment_method_details, {_FINGERPRINT_PATH}) AS fingerprint,
+            c.{_CHARGE_CUSTOMER_COL}                                         AS stripe_customer,
+            c.created
         FROM {_CHG_TABLE} c
         INNER JOIN target_customers tc
           ON tc.stripe_customer = c.{_CHARGE_CUSTOMER_COL}
-        WHERE c.{_FINGERPRINT_COL} IS NOT NULL
-        GROUP BY c.{_FINGERPRINT_COL}
+        WHERE GET_JSON_OBJECT(c.payment_method_details, {_FINGERPRINT_PATH}) IS NOT NULL
+    ),
+    target_fingerprints AS (
+        SELECT
+            fingerprint,
+            MIN(FROM_UNIXTIME(created)) AS first_used_on_this_account
+        FROM target_charge_fps
+        GROUP BY fingerprint
     ),
     other_company_customers AS (
         -- Stripe customer IDs for all OTHER companies
@@ -805,22 +822,28 @@ def check_fingerprint_reuse(company_id: int) -> Dict[str, Any]:
           AND s.{_SUB_COMPANY_COL} != 1987234
           AND s.{_SUB_CUSTOMER_COL} IS NOT NULL
     ),
-    matched_other_accounts AS (
-        -- Other companies whose charges share a fingerprint with the target
+    other_charge_fps AS (
+        -- Extract fingerprint from JSON for charges on other companies
         SELECT
-            c.{_FINGERPRINT_COL}              AS fingerprint,
+            GET_JSON_OBJECT(c.payment_method_details, {_FINGERPRINT_PATH}) AS fingerprint,
             occ.other_company_id,
-            co.name                           AS other_company_name,
-            MIN(CAST(c.created AS TIMESTAMP)) AS first_seen_at_other_account
+            c.created
         FROM {_CHG_TABLE} c
         INNER JOIN other_company_customers occ
           ON occ.stripe_customer = c.{_CHARGE_CUSTOMER_COL}
-        INNER JOIN public.companies co
-          ON co.company_id = occ.other_company_id
         INNER JOIN target_fingerprints tf
-          ON tf.fingerprint = c.{_FINGERPRINT_COL}
-        WHERE c.{_FINGERPRINT_COL} IS NOT NULL
-        GROUP BY c.{_FINGERPRINT_COL}, occ.other_company_id, co.name
+          ON tf.fingerprint = GET_JSON_OBJECT(c.payment_method_details, {_FINGERPRINT_PATH})
+        WHERE GET_JSON_OBJECT(c.payment_method_details, {_FINGERPRINT_PATH}) IS NOT NULL
+    ),
+    matched_other_accounts AS (
+        SELECT
+            ocf.fingerprint,
+            ocf.other_company_id,
+            co.name                       AS other_company_name,
+            MIN(FROM_UNIXTIME(ocf.created)) AS first_seen_at_other_account
+        FROM other_charge_fps ocf
+        INNER JOIN public.companies co ON co.company_id = ocf.other_company_id
+        GROUP BY ocf.fingerprint, ocf.other_company_id, co.name
     )
     SELECT
         m.fingerprint,
