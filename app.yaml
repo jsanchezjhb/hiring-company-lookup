@@ -1,0 +1,25 @@
+# app.yaml — Databricks App configuration
+# Place this file in the same directory as app.py
+# Deploy via: Databricks UI → Apps → Create App → select this folder
+
+command:
+  - streamlit
+  - run
+  - app.py
+  - --server.port
+  - "8080"
+  - --server.headless
+  - "true"
+  - --server.enableCORS
+  - "false"
+
+# Environment variables
+# Set SQL_WAREHOUSE_HTTP_PATH to your SQL Warehouse's HTTP path.
+# Find it in: Databricks → SQL Warehouses → <your warehouse> → Connection Details
+#
+# DATABRICKS_HOST is automatically injected by Databricks Apps.
+# DATABRICKS_TOKEN is NOT needed in production (OAuth is used automatically).
+# For local dev, set DATABRICKS_TOKEN to a Personal Access Token.
+env:
+  - name: SQL_WAREHOUSE_HTTP_PATH
+    value: "/sql/1.0/warehouses/YOUR_WAREHOUSE_ID_HERE"
