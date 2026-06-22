@@ -1,13 +1,8 @@
 """
-db_utils.py — Database connection via direct REST API calls.
+db_utils.py — Database connection via direct REST API.
 
-Bypasses the Databricks SDK's Config validation entirely, which was causing
-"two auth methods" conflicts between DATABRICKS_TOKEN and OAuth credentials.
-
-Auth priority:
-  1. X-Forwarded-Access-Token header  — user's token (User Authorization)
-  2. DATABRICKS_TOKEN env var         — PAT for local dev
-  3. OAuth M2M via OIDC endpoint      — service principal (production fallback)
+Tries every known location where Databricks Apps can inject the user's token,
+so queries run under the logged-in user's identity and inherit their permissions.
 """
 
 import os
@@ -19,23 +14,37 @@ _HOST = os.environ.get("DATABRICKS_HOST", "").strip()
 
 
 def _get_token() -> str:
-    """Return the best available auth token."""
+    """
+    Return the best available token, trying all known injection points.
 
-    # 1. User Authorization (Databricks Apps injects this per-user)
+    Databricks Apps with User Authorization enabled may inject the user's
+    token in several ways depending on platform version — we try them all.
+    """
+    # 1. X-Forwarded-Access-Token header (Databricks Apps standard)
     try:
-        token = st.context.headers.get("X-Forwarded-Access-Token", "")
-        if token:
-            return token
+        t = st.context.headers.get("X-Forwarded-Access-Token", "").strip()
+        if t:
+            return t
     except AttributeError:
         pass
 
-    # 2. PAT for local dev
-    pat = os.environ.get("DATABRICKS_TOKEN", "").strip()
-    if pat:
-        return pat
+    # 2. Authorization header (Bearer <token>)
+    try:
+        auth = st.context.headers.get("Authorization", "").strip()
+        if auth.lower().startswith("bearer "):
+            t = auth[7:].strip()
+            if t:
+                return t
+    except AttributeError:
+        pass
 
-    # 3. OAuth M2M — fetch token from OIDC endpoint
-    client_id     = os.environ.get("DATABRICKS_CLIENT_ID", "").strip()
+    # 3. DATABRICKS_TOKEN env var (may be set per-session by User Authorization)
+    t = os.environ.get("DATABRICKS_TOKEN", "").strip()
+    if t:
+        return t
+
+    # 4. OAuth M2M — service principal (may 403 if SP lacks workspace access)
+    client_id     = os.environ.get("DATABRICKS_CLIENT_ID",     "").strip()
     client_secret = os.environ.get("DATABRICKS_CLIENT_SECRET", "").strip()
 
     resp = requests.post(
@@ -49,12 +58,16 @@ def _get_token() -> str:
 
 
 def _warehouse_id() -> str:
+    """
+    Extract warehouse ID from SQL_WAREHOUSE_HTTP_PATH.
+    e.g. /sql/1.0/warehouses/abc123  →  abc123
+    """
     path = os.environ.get("SQL_WAREHOUSE_HTTP_PATH", "").rstrip("/")
     wid  = path.split("/")[-1]
     if not wid or wid == "YOUR_WAREHOUSE_ID_HERE":
         raise RuntimeError(
             "SQL_WAREHOUSE_HTTP_PATH is not configured.\n"
-            "Set it to the HTTP Path from your SQL Warehouse Connection Details."
+            "Set it to the HTTP Path from: SQL Warehouses → [warehouse] → Connection Details."
         )
     return wid
 
@@ -68,7 +81,7 @@ def run_query(sql_text: str) -> pd.DataFrame:
         f"https://{_HOST}/api/2.0/sql/statements",
         headers={"Authorization": f"Bearer {token}"},
         json={
-            "statement":   sql_text,
+            "statement":    sql_text,
             "warehouse_id": wid,
             "wait_timeout": "50s",
             "disposition":  "INLINE",
@@ -77,9 +90,9 @@ def run_query(sql_text: str) -> pd.DataFrame:
         timeout=60,
     )
     resp.raise_for_status()
-    data = resp.json()
-
+    data  = resp.json()
     state = data.get("status", {}).get("state", "UNKNOWN")
+
     if state != "SUCCEEDED":
         error = data.get("status", {}).get("error", {})
         raise Exception(f"Query failed [{state}]: {error.get('message', state)}")
