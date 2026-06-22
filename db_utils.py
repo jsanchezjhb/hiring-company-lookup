@@ -1,22 +1,21 @@
 """
 db_utils.py — Database connection via databricks-sql-connector.
 
-Uses the warehouse HTTP path (Thrift/JDBC protocol) with the user's
-X-Forwarded-Access-Token from Databricks Apps User Authorization.
-This is the same protocol Databricks SQL uses, so if the user can
-run queries there, this works too.
+Uses credentials_provider to pass the user's OAuth JWT token
+(X-Forwarded-Access-Token) from Databricks Apps User Authorization.
+Matches the exact connector + SDK versions from the working internal app.
 """
 
 import os
 import streamlit as st
 import pandas as pd
 
-_HOST      = os.environ.get("DATABRICKS_HOST",          "").strip()
-_HTTP_PATH = os.environ.get("SQL_WAREHOUSE_HTTP_PATH",  "").strip()
+_HOST      = os.environ.get("DATABRICKS_HOST",         "").strip()
+_HTTP_PATH = os.environ.get("SQL_WAREHOUSE_HTTP_PATH", "").strip()
 
 
 def _user_token() -> str:
-    """Get the logged-in user's token from the Databricks Apps header."""
+    """Get the logged-in user's OAuth token from Databricks Apps."""
     try:
         t = st.context.headers.get("X-Forwarded-Access-Token", "").strip()
         if t:
@@ -28,20 +27,25 @@ def _user_token() -> str:
 
 
 def run_query(sql_text: str) -> pd.DataFrame:
-    """Execute SQL via the SQL connector (Thrift protocol)."""
+    """Execute SQL via the SQL connector using the user's OAuth token."""
     from databricks import sql
 
     token = _user_token()
     if not token:
         raise RuntimeError(
-            "No user token available.\n"
-            "Make sure User Authorization is enabled in Apps → Edit → User Authorization."
+            "No user token available. "
+            "Ensure User Authorization is enabled in Apps → Edit → User Authorization."
         )
+
+    # credentials_provider is the correct way to pass an OAuth JWT token.
+    # access_token only works for PAT (dapi...) tokens.
+    def token_provider():
+        return {"Authorization": f"Bearer {token}"}
 
     conn = sql.connect(
         server_hostname=_HOST,
         http_path=_HTTP_PATH,
-        access_token=token,
+        credentials_provider=token_provider,
     )
     try:
         with conn.cursor() as cursor:
