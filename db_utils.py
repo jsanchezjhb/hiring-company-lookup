@@ -22,16 +22,18 @@ def _sdk_client():
     """
     Return a WorkspaceClient authenticated as the current user.
 
-    Databricks Apps injects the logged-in user's token via the
-    X-Forwarded-Access-Token request header when User Authorization is on.
-    We pass that token explicitly so Unity Catalog sees the user's identity,
-    not the app service principal's.
+    When Databricks Apps User Authorization is enabled, the logged-in user's
+    token arrives in the X-Forwarded-Access-Token header. We use that token
+    so Unity Catalog queries run as the user, not the service principal.
+
+    If no user token is found (local dev, or User Authorization not enabled),
+    WorkspaceClient() is called with NO arguments so the SDK auto-discovers
+    auth from DATABRICKS_CLIENT_ID / DATABRICKS_CLIENT_SECRET env vars.
+    Passing an empty token= alongside OAuth env vars causes a conflict, so
+    we only pass token when it is genuinely non-empty.
     """
     from databricks.sdk import WorkspaceClient
 
-    host = os.environ.get("DATABRICKS_HOST", "").strip()
-
-    # Read the per-user token injected by Databricks Apps
     user_token = ""
     try:
         user_token = st.context.headers.get("X-Forwarded-Access-Token", "")
@@ -40,14 +42,10 @@ def _sdk_client():
         pass
 
     if user_token:
+        host = os.environ.get("DATABRICKS_HOST", "").strip()
         return WorkspaceClient(host=host, token=user_token)
 
-    # Local dev: fall back to PAT token or environment-based service principal
-    pat = os.environ.get("DATABRICKS_TOKEN", "").strip()
-    if pat:
-        return WorkspaceClient(host=host, token=pat)
-
-    # Last resort: let the SDK discover credentials from the environment
+    # No user token — let SDK pick up OAuth or PAT from env vars automatically
     return WorkspaceClient()
 
 
