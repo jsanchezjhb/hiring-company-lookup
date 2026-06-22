@@ -1,22 +1,22 @@
 # Hiring Fraud Detection App
 
-Internal Homebase tool for the service team to investigate suspicious company behaviour in the Hiring product. Enter a Company ID to run all fraud signal checks and see results with drill-down details.
+Internal Homebase tool for the service team to investigate suspicious company behaviour in the Hiring product. Enter a Company ID to run all fraud signal checks and see results at a glance — click any card to expand the full detail table.
 
 ---
 
 ## Signal Status
 
-| # | Signal | Status | Table(s) |
-|---|--------|--------|----------|
-| 1 | 10+ Active Job Posts | ✅ Live | `prod_redshift_replica.postgres.hiring_job_requests` |
-| 2 | Jobs Posted < 1 Min Apart | ✅ Live | `prod_redshift_replica.postgres.hiring_job_requests` |
-| 3 | 4+ Jobs Within One Hour | ✅ Live | `prod_redshift_replica.postgres.hiring_job_requests` |
-| 4 | IP / Location Mismatch | ✅ Live | `prod_redshift_replica.heap.sign_up_owner_signed_up`, `prod_redshift_replica.homebase1.locations` |
-| 5 | Dormancy Reactivation (30+ days) | ✅ Live | `prod_redshift_replica.postgres.hiring_job_requests` |
-| 6 | Failed Billing | ✅ Live | `prod_redshift_replica.stripe.charge`, `prod_redshift_replica.stripe.customer_subscription` |
-| 7 | Billing Disputes | ✅ Live | `prod_redshift_replica.stripe.charge`, `prod_redshift_replica.stripe.customer_subscription` |
-| 8 | Payment Method Changes (3+) | ✅ Live | `prod_redshift_replica.stripe.charge`, `prod_redshift_replica.stripe.customer_subscription` |
-| 9 | Stripe Fingerprint Reuse | ✅ Live | `prod_redshift_replica.stripe.charge`, `prod_redshift_replica.stripe.customer_subscription` |
+| # | Signal | Table(s) |
+|---|--------|----------|
+| 1 | 10+ Active Job Posts | `prod_redshift_replica.postgres.hiring_job_requests` |
+| 2 | Jobs Posted < 1 Min Apart | `prod_redshift_replica.postgres.hiring_job_requests` |
+| 3 | 4+ Jobs Within One Hour | `prod_redshift_replica.postgres.hiring_job_requests` |
+| 4 | IP / Location Mismatch | `prod_redshift_replica.heap.sign_up_owner_signed_up`, `prod_redshift_replica.postgres.locations` |
+| 5 | Dormancy Reactivation (30+ days) | `prod_redshift_replica.postgres.hiring_job_requests` |
+| 6 | Failed Billing | `prod_redshift_replica.stripe.charge`, `prod_redshift_replica.stripe.customer_subscription` |
+| 7 | Billing Disputes | `prod_redshift_replica.stripe.charge`, `prod_redshift_replica.stripe.customer_subscription` |
+| 8 | Payment Method Changes (3+) | `prod_redshift_replica.stripe.charge`, `prod_redshift_replica.stripe.customer_subscription` |
+| 9 | Stripe Fingerprint Reuse | `prod_redshift_replica.stripe.charge`, `prod_redshift_replica.stripe.customer_subscription` |
 
 All signals use the `prod_redshift_replica` catalog.
 
@@ -37,22 +37,18 @@ hiring-company-lookup/
 
 ## Deployment
 
-### Prerequisites
-- Access to Databricks workspace `homebase-staging.cloud.databricks.com`
-- The app is connected to the `readers-staging-sqlwh-01` SQL Warehouse
+### Source
+The app deploys from GitHub: `https://github.com/jsanchezjhb/hiring-company-lookup` (branch: `main`)
 
-### Steps
+Push file changes to `main`, then click **Deploy** in Databricks Apps.
 
-1. Push all files to the GitHub repo (`hiring-company-lookup`, `main` branch)
-2. In Databricks → **Apps** → `hiring-company-lookup` → **Edit**
-3. Verify **Resources** tab has `readers-staging-sqlwh-01` with **Can Use**
-4. Verify **Environment Variables** has:
-   - `SQL_WAREHOUSE_HTTP_PATH` = `/sql/1.0/warehouses/16984dfe9a2c3705`
-5. Verify **User Authorization** is **ON**
-6. Click **Deploy**
+### Databricks App Settings
+- **User Authorization**: OFF
+- **Resources**: `readers-staging-sqlwh-01` with Can Use
+- **Environment Variables**: `SQL_WAREHOUSE_HTTP_PATH` = `/sql/1.0/warehouses/16984dfe9a2c3705`
 
 ### app.yaml
-The `app.yaml` file must exist and contain only:
+Must exist with exactly:
 ```yaml
 command:
   - streamlit
@@ -65,15 +61,34 @@ Without it, Databricks runs `python app.py` instead of Streamlit and the app cra
 
 ## Authentication
 
-The app uses **User Authorization** (Apps → Edit → User Authorization = ON).
+The app uses the service principal (`195f838c-927a-45f9-94f4-2b59a9c7a453`) via OAuth M2M — the same pattern as the billing-disputes app:
 
-Databricks injects the logged-in user's OAuth token via the `X-Forwarded-Access-Token` request header. The app passes this token to the SQL connector using `Config(token=user_token)` + `credentials_provider=lambda: cfg.authenticate` — the same pattern used by the billing-disputes app.
+```python
+from databricks.sdk.core import Config
+from databricks import sql
 
-Queries run as the logged-in user and inherit their Unity Catalog permissions. No service principal grants needed.
+cfg  = Config()
+conn = sql.connect(
+    server_hostname=DATABRICKS_HOST,
+    http_path=DATABRICKS_HTTP_PATH,
+    credentials_provider=lambda: cfg.authenticate,
+)
+```
+
+**User Authorization must be OFF.** When it's on, Databricks injects `DATABRICKS_TOKEN` alongside `DATABRICKS_CLIENT_ID`/`SECRET`, causing a "two auth methods" conflict that breaks the SDK.
 
 ---
 
-## Key SQL Rules
+## Adding a New Signal
+
+1. Add a function to `queries.py` following the existing pattern — return `_result("ALERT"/"CLEAR", message, df, count)`
+2. Add it to `SIGNAL_FNS` dict in `app.py`
+3. Add a `signal_card(...)` call in the appropriate section of `app.py`
+4. Push to `main` and deploy
+
+---
+
+## Key SQL Patterns
 
 **Hiring job queries (Signals 1–5)**
 ```sql
@@ -83,26 +98,24 @@ WHERE hjr.hiring_version = 2
   AND (hjr.activated_at IS NOT NULL OR hjr.flagged_at IS NOT NULL)
   AND c.company_id != 1987234        -- exclude test company
 
--- created_at is already a TIMESTAMP — no conversion needed
-CAST(hjr.created_at AS DATE)         -- date
-UNIX_TIMESTAMP(created_at)           -- seconds (for gap calculations)
+-- created_at is already a TIMESTAMP — no TIMESTAMP_MICROS() needed
+UNIX_TIMESTAMP(created_at)            -- seconds (for gap calculations)
 DATEDIFF(created_at, prev_created_at) -- day gaps
 
--- Jobs scope: company → locations → job_requests
-INNER JOIN prod_redshift_replica.public.locations l ON l.location_id = hjr.location_id
-INNER JOIN prod_redshift_replica.public.companies c ON c.company_id = l.company_id
+-- Always use full 3-part table names
+INNER JOIN prod_redshift_replica.public.locations l  ON l.location_id = hjr.location_id
+INNER JOIN prod_redshift_replica.public.companies c  ON c.company_id  = l.company_id
 ```
 
 **Stripe queries (Signals 6–9)**
 ```sql
--- Company → Stripe customer mapping
--- company_id is stored as a JSON string inside the metadata column
+-- Company → Stripe customer mapping via metadata JSON
 SELECT DISTINCT customer
 FROM prod_redshift_replica.stripe.customer_subscription
 WHERE GET_JSON_OBJECT(metadata, '$.company_id') = '{company_id}'
 
 -- charge.created is Unix epoch seconds
-FROM_UNIXTIME(c.created)            -- convert to timestamp
+FROM_UNIXTIME(c.created)
 
 -- Card fingerprint is nested JSON
 GET_JSON_OBJECT(payment_method_details, '$.card.fingerprint')
@@ -110,22 +123,13 @@ GET_JSON_OBJECT(payment_method_details, '$.card.fingerprint')
 
 ---
 
-## Adding a New Signal
+## Workspace Reference
 
-1. Open `queries.py`
-2. Add a new function following the existing pattern — return `_result("ALERT"/"CLEAR", message, df, count)`
-3. Add the function to `SIGNAL_FNS` dict in `app.py`
-4. Add a `signal_card(...)` call in the appropriate section of `app.py`
-5. Deploy
-
----
-
-## Databricks Workspace Info
-
-| Setting | Value |
-|---------|-------|
+| | |
+|---|---|
 | Host | `homebase-staging.cloud.databricks.com` |
 | Warehouse | `readers-staging-sqlwh-01` |
 | HTTP Path | `/sql/1.0/warehouses/16984dfe9a2c3705` |
-| Primary Catalog | `prod_redshift_replica` |
-| App Service Principal | `195f838c-927a-45f9-94f4-2b59a9c7a453` |
+| Catalog | `prod_redshift_replica` |
+| App SP | `195f838c-927a-45f9-94f4-2b59a9c7a453` |
+| GitHub | `github.com/jsanchezjhb/hiring-company-lookup` |
