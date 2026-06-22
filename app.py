@@ -8,7 +8,6 @@ Entry point for the Databricks App. Run with:
 
 import streamlit as st
 import pandas as pd
-import os
 
 from queries import (
     get_company_info,
@@ -195,21 +194,6 @@ def signal_card(
 # ─── Main app ─────────────────────────────────────────────────────────────────
 
 def main():
-    # ── Auth diagnostic (sidebar) — remove once auth is confirmed working ───
-    with st.sidebar:
-        st.markdown("**🔑 Auth Diagnostic**")
-        try:
-            fwd   = st.context.headers.get("X-Forwarded-Access-Token", "")
-            auth  = st.context.headers.get("Authorization", "")
-            token = os.environ.get("DATABRICKS_TOKEN", "")
-            st.write("X-Forwarded-Access-Token:", "✅ present" if fwd   else "❌ empty")
-            st.write("Authorization header:",     "✅ present" if auth  else "❌ empty")
-            st.write("DATABRICKS_TOKEN env:",     "✅ present" if token else "❌ empty")
-            if not any([fwd, auth, token]):
-                st.warning("⚠️ No user token found — falling back to service principal OAuth")
-        except Exception as e:
-            st.write(f"Header check error: {e}")
-
     # ── App header ──────────────────────────────────────────────────────────
     st.markdown('<div class="app-title">🔍 Hiring Fraud Detection Tool</div>', unsafe_allow_html=True)
     st.markdown(

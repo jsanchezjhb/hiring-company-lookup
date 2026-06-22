@@ -10,20 +10,48 @@ Status values:
   "CLEAR"   — no issues found
   "PENDING" — not yet implemented (needs additional info)
   "ERROR"   — query failed (detail in message)
-
-Table notes (Databricks / Spark SQL):
-  - hiring_job_requests.created_at  → already a TIMESTAMP (no conversion needed)
-  - hiring_job_requests.activated_at → regular timestamp
-  - Always filter hiring_version = 2
-  - Always exclude test company 1987234
-  - Job scope: company_id → public.locations → postgres.hiring_job_requests
 """
 
 from __future__ import annotations
 
+import os
+import streamlit as st
 from typing import Any, Dict
 import pandas as pd
-from db_utils import run_query
+
+_HOST      = os.environ.get("DATABRICKS_HOST",         "").strip()
+_HTTP_PATH = os.environ.get("SQL_WAREHOUSE_HTTP_PATH", "").strip()
+
+
+def _user_token() -> str:
+    try:
+        t = st.context.headers.get("X-Forwarded-Access-Token", "").strip()
+        if t:
+            return t
+    except AttributeError:
+        pass
+    return os.environ.get("DATABRICKS_TOKEN", "").strip()
+
+
+def run_query(sql_text: str) -> pd.DataFrame:
+    from databricks.sdk.core import Config
+    from databricks import sql
+
+    token = _user_token()
+    if not token:
+        raise RuntimeError("No user token. Enable User Authorization in Apps → Edit.")
+
+    cfg = Config(host=_HOST, token=token)
+    conn = sql.connect(
+        server_hostname=cfg.host,
+        http_path=_HTTP_PATH,
+        credentials_provider=lambda: cfg.authenticate,
+    )
+    with conn.cursor() as cursor:
+        cursor.execute(sql_text)
+        rows = cursor.fetchall()
+        cols = [d[0] for d in cursor.description] if cursor.description else []
+        return pd.DataFrame(rows, columns=cols)
 
 
 # ---------------------------------------------------------------------------
