@@ -327,7 +327,7 @@ def check_hourly_burst(company_id: int) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 _IP_SIGNUP_TABLE = "prod_redshift_replica.heap.sign_up_owner_signed_up"
-_LOCATION_TABLE  = "prod_redshift_replica.homebase1.locations"
+_LOCATION_TABLE  = "prod_redshift_replica.public.locations"
 
 
 def check_ip_location_mismatch(company_id: int) -> Dict[str, Any]:
@@ -710,18 +710,18 @@ def check_fingerprint_reuse(company_id: int) -> Dict[str, Any]:
     other_matches AS (
         SELECT
             GET_JSON_OBJECT(c.payment_method_details, {_FINGERPRINT_PATH}) AS fingerprint,
-            CAST({_META_CO_ID} AS INT)                                       AS other_company_id,
+            CAST(GET_JSON_OBJECT(s.metadata, '$.company_id') AS INT)        AS other_company_id,
             MIN(FROM_UNIXTIME(c.created))                                    AS first_seen_at
         FROM {_CHG_TABLE} c
         INNER JOIN {_SUB_TABLE} s ON s.customer = c.customer
         INNER JOIN target_fps tf
           ON tf.fingerprint = GET_JSON_OBJECT(c.payment_method_details, {_FINGERPRINT_PATH})
-        WHERE {_META_CO_ID} != '{company_id}'
-          AND {_META_CO_ID} IS NOT NULL
+        WHERE GET_JSON_OBJECT(s.metadata, '$.company_id') != '{company_id}'
+          AND GET_JSON_OBJECT(s.metadata, '$.company_id') IS NOT NULL
           AND GET_JSON_OBJECT(c.payment_method_details, {_FINGERPRINT_PATH}) IS NOT NULL
         GROUP BY
             GET_JSON_OBJECT(c.payment_method_details, {_FINGERPRINT_PATH}),
-            {_META_CO_ID}
+            GET_JSON_OBJECT(s.metadata, '$.company_id')
     )
     SELECT
         om.fingerprint,
