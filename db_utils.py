@@ -89,13 +89,19 @@ def run_query(sql_text: str) -> pd.DataFrame:
         statement=sql_text,
         warehouse_id=wid,
         wait_timeout="50s",
-        on_wait_timeout="CANCEL",
+        # on_wait_timeout intentionally omitted — passing a raw string
+        # causes 'str has no attribute .value' inside the SDK serializer.
+        # Default behaviour is CANCEL, which is what we want.
     )
 
-    if resp.status.state != StatementState.SUCCEEDED:
+    # Compare state safely across SDK versions (enum or string)
+    state     = resp.status.state if resp.status else None
+    state_str = state.value if hasattr(state, "value") else str(state)
+
+    if state_str != "SUCCEEDED":
         error = getattr(resp.status, "error", None)
-        msg   = error.message if error else str(resp.status.state)
-        raise Exception(f"Query failed: {msg}")
+        msg   = error.message if error else state_str
+        raise Exception(f"Query failed [{state_str}]: {msg}")
 
     # No rows returned
     if not resp.result or not resp.result.data_array:
