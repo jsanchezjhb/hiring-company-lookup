@@ -260,21 +260,203 @@ def check_hourly_burst(company_id: int) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Signal 4 — IP / Location Mismatch  (PENDING — needs existing query)
+# Signal 4 — IP / Location Mismatch
 # ---------------------------------------------------------------------------
+#
+# TABLE NAME NOTES
+# ─────────────────
+# These two paths are from the original Redshift query.
+# If the Databricks schema names differ, update the constants below —
+# everything else will pick up the change automatically.
+#
+#   _IP_SIGNUP_TABLE   : Heap signup events with IP, city, region, country
+#                        Original: prod_redshift_replica.heap.sign_up_owner_signed_up
+#                        Databricks equivalent may be: heap.sign_up_owner_signed_up
+#                        or ext_heap.sign_up_owner_signed_up
+#
+#   _LOCATION_TABLE    : Locations with provided city / state / zip
+#                        Original: prod_raw.homebase1.locations
+#                        Databricks equivalent may be: public.locations
+#                        (verify that city, state, zip columns exist)
+#
+# HOW location_match_status IS SCORED
+# ─────────────────────────────────────
+#   'City Match'       →  ip_city == provided_city          (CLEAR)
+#   'State Match Only' →  ip_state == provided_state only   (surfaced, not ALERTed)
+#   'No Match'         →  neither city nor state matches    (ALERT)
+#
+# mismatch_pct heuristic (from the original query):
+#   0%   exact city match
+#   10%  partial city name overlap
+#   25%  known CDN/cloud hub city with state mismatch (Ashburn, Atlanta, etc.)
+#   30%  state match only
+#   60%  US country match, city/state mismatch
+#   65%  Canada, city/state mismatch
+#   90%  foreign country
+# ---------------------------------------------------------------------------
+
+_IP_SIGNUP_TABLE = "prod_redshift_replica.heap.sign_up_owner_signed_up"
+_LOCATION_TABLE  = "prod_raw.homebase1.locations"
+
 
 def check_ip_location_mismatch(company_id: int) -> Dict[str, Any]:
     """
-    ALERT if the account creation IP address does not match the company's
-    city or state.
+    ALERT if the IP address at account creation does not align with the
+    company's registered city or state.
 
-    STATUS: Pending — the user has an existing query for this signal.
-    Once shared, it will be integrated here.
+    Returns ALL rows (City Match, State Match Only, No Match) so the rep
+    gets the full picture. ALERTs when at least one row is 'No Match'.
+    mismatch_pct is the heuristic likelihood that this is genuine fraud
+    (not a VPN / cloud IP / CDN exit node).
     """
-    return _pending(
-        "Awaiting your existing IP mismatch query. "
-        "Please paste it in the thread and it will be wired in here."
+    sql = f"""
+    WITH state_abbrev AS (
+        SELECT abbr, full_name
+        FROM (VALUES
+            ('AL','Alabama'),('AK','Alaska'),('AZ','Arizona'),('AR','Arkansas'),
+            ('CA','California'),('CO','Colorado'),('CT','Connecticut'),('DE','Delaware'),
+            ('FL','Florida'),('GA','Georgia'),('HI','Hawaii'),('ID','Idaho'),
+            ('IL','Illinois'),('IN','Indiana'),('IA','Iowa'),('KS','Kansas'),
+            ('KY','Kentucky'),('LA','Louisiana'),('ME','Maine'),('MD','Maryland'),
+            ('MA','Massachusetts'),('MI','Michigan'),('MN','Minnesota'),('MS','Mississippi'),
+            ('MO','Missouri'),('MT','Montana'),('NE','Nebraska'),('NV','Nevada'),
+            ('NH','New Hampshire'),('NJ','New Jersey'),('NM','New Mexico'),('NY','New York'),
+            ('NC','North Carolina'),('ND','North Dakota'),('OH','Ohio'),('OK','Oklahoma'),
+            ('OR','Oregon'),('PA','Pennsylvania'),('RI','Rhode Island'),('SC','South Carolina'),
+            ('SD','South Dakota'),('TN','Tennessee'),('TX','Texas'),('UT','Utah'),
+            ('VT','Vermont'),('VA','Virginia'),('WA','Washington'),('WV','West Virginia'),
+            ('WI','Wisconsin'),('WY','Wyoming'),('DC','District of Columbia'),
+            ('AB','Alberta'),('BC','British Columbia'),('MB','Manitoba'),
+            ('NB','New Brunswick'),('NL','Newfoundland and Labrador'),('NS','Nova Scotia'),
+            ('NT','Northwest Territories'),('NU','Nunavut'),('ON','Ontario'),
+            ('PE','Prince Edward Island'),('QC','Quebec'),('SK','Saskatchewan'),
+            ('YT','Yukon')
+        ) AS t(abbr, full_name)
+    ),
+    signup_geo AS (
+        SELECT
+            company_id,
+            location_id,
+            ip,
+            city        AS ip_city,
+            region      AS ip_region,
+            country     AS ip_country,
+            time        AS signup_time
+        FROM {_IP_SIGNUP_TABLE}
+        WHERE ip         IS NOT NULL
+          AND company_id  = {company_id}
+    ),
+    location_address AS (
+        SELECT
+            id           AS location_id,
+            company_id,
+            city         AS provided_city,
+            state        AS provided_state,
+            zip,
+            address_1
+        FROM {_LOCATION_TABLE}
+        WHERE city        IS NOT NULL
+          AND company_id  = {company_id}
     )
+    SELECT
+        sg.company_id,
+        sg.ip,
+        sg.ip_city,
+        sg.ip_region,
+        sg.ip_country,
+        la.provided_city,
+        la.provided_state,
+        la.zip,
+        COALESCE(sa_ip.abbr,  LOWER(TRIM(sg.ip_region)))       AS ip_state_normalized,
+        COALESCE(LOWER(sa_loc.full_name), LOWER(TRIM(la.provided_state))) AS provided_state_normalized,
+
+        CASE
+            WHEN LOWER(TRIM(sg.ip_city)) = LOWER(TRIM(la.provided_city))
+                THEN 'City Match'
+            WHEN COALESCE(LOWER(sa_ip.abbr),  LOWER(TRIM(sg.ip_region)))
+               = COALESCE(LOWER(la.provided_state), '')
+              OR LOWER(TRIM(sg.ip_region))
+               = COALESCE(LOWER(sa_loc.full_name), '')
+                THEN 'State Match Only'
+            ELSE 'No Match'
+        END AS location_match_status,
+
+        CONCAT(
+            CASE
+                WHEN LOWER(TRIM(sg.ip_city)) = LOWER(TRIM(la.provided_city))
+                    THEN '0'
+                WHEN LOWER(la.provided_city) LIKE '%' || LOWER(TRIM(sg.ip_city)) || '%'
+                  OR LOWER(TRIM(sg.ip_city)) LIKE '%' || LOWER(TRIM(la.provided_city)) || '%'
+                    THEN '10'
+                WHEN LOWER(TRIM(sg.ip_city)) IN (
+                        'ashburn','atlanta','chicago','dallas',
+                        'seattle','los angeles','san jose'
+                     )
+                  AND COALESCE(LOWER(sa_ip.abbr), LOWER(TRIM(sg.ip_region)))
+                   != LOWER(TRIM(la.provided_state))
+                  AND LOWER(TRIM(sg.ip_region))
+                   != COALESCE(LOWER(sa_loc.full_name), '')
+                    THEN '25'
+                WHEN COALESCE(LOWER(sa_ip.abbr), LOWER(TRIM(sg.ip_region)))
+                   = LOWER(TRIM(la.provided_state))
+                  OR LOWER(TRIM(sg.ip_region)) = COALESCE(LOWER(sa_loc.full_name), '')
+                    THEN '30'
+                WHEN LOWER(TRIM(sg.ip_country)) = 'united states'     THEN '60'
+                WHEN LOWER(TRIM(sg.ip_country)) = 'canada'            THEN '65'
+                WHEN LOWER(TRIM(sg.ip_country))
+                     NOT IN ('united states','canada')                 THEN '90'
+                ELSE '50'
+            END,
+            '%'
+        ) AS mismatch_pct,
+
+        sg.signup_time
+    FROM signup_geo sg
+    JOIN location_address la
+      ON sg.company_id = la.company_id
+    LEFT JOIN state_abbrev sa_ip
+      ON LOWER(TRIM(sg.ip_region)) = LOWER(sa_ip.full_name)
+    LEFT JOIN state_abbrev sa_loc
+      ON LOWER(TRIM(la.provided_state)) = LOWER(sa_loc.abbr)
+    ORDER BY sg.signup_time DESC
+    """
+    try:
+        df = run_query(sql)
+
+        if df.empty:
+            return _result(
+                "CLEAR",
+                "No signup geo data found for this company",
+                df,
+                0,
+            )
+
+        # Count by status
+        status_counts = (
+            df["location_match_status"].value_counts().to_dict()
+            if "location_match_status" in df.columns
+            else {}
+        )
+        no_match_count    = status_counts.get("No Match",       0)
+        state_only_count  = status_counts.get("State Match Only", 0)
+        city_match_count  = status_counts.get("City Match",     0)
+
+        flagged = no_match_count > 0
+
+        parts = []
+        if no_match_count:
+            parts.append(f"{no_match_count} No Match")
+        if state_only_count:
+            parts.append(f"{state_only_count} State Match Only")
+        if city_match_count:
+            parts.append(f"{city_match_count} City Match")
+
+        msg = "  |  ".join(parts) if parts else "No rows returned"
+
+        return _result("ALERT" if flagged else "CLEAR", msg, df, no_match_count)
+
+    except Exception as exc:
+        return _error(exc)
 
 
 # ---------------------------------------------------------------------------

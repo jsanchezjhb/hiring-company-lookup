@@ -405,11 +405,13 @@ def main():
         icon="🌐",
         title="IP / Location Mismatch",
         description=(
-            "Flags when the IP address used to create the account does not align "
-            "with the company's city or state on file."
+            "Compares the IP address at account creation against the company's registered city and state. "
+            "Returns all rows — City Match, State Match Only, and No Match — so you can see the full picture. "
+            "ALERTs on any 'No Match' result. "
+            "The mismatch_pct column shows the heuristic fraud likelihood "
+            "(e.g. known CDN cities like Ashburn score lower than a foreign-country IP)."
         ),
         result=results["ip_mismatch"],
-        expand_on_alert=False,  # set True once query is live
     )
 
     # ─────────────────────────────────────────────────────────────────────────
