@@ -529,185 +529,306 @@ def check_dormancy_reactivation(company_id: int) -> Dict[str, Any]:
         return _error(exc)
 
 
+# ===========================================================================
+# Stripe table / column constants
+# ===========================================================================
+# All Stripe signal functions reference these constants.
+# If a column name or table path differs from what's in your workspace,
+# update the constant here — every query that uses it picks up the change.
+#
+# Tables confirmed from workspace screenshot:
+#   prod_enriched.stripe.stripe_transactions  — tx-level: amount, status, invoices, subscriptions
+#   prod_enriched.stripe.stripe_subscription  — subscription details incl. company/location
+#   prod_raw.stripe.charge                    — raw charge objects (disputed flag, fingerprint)
+#
+# Uncertain column names are marked with ← VERIFY; adjust as needed after
+# running a quick `SELECT * FROM <table> LIMIT 1` in Databricks.
+# ===========================================================================
+
+# Tables
+_TXN_TABLE  = "prod_enriched.stripe.stripe_transactions"   # Signal 6
+_SUB_TABLE  = "prod_enriched.stripe.stripe_subscription"   # Signals 7, 8, 9 (company linkage)
+_CHG_TABLE  = "prod_raw.stripe.charge"                     # Signals 7, 9
+
+# Company/location join column in the enriched subscription table.
+# Try company_id first; if the table only has location_id, swap to:
+#   _SUB_COMPANY_COL = "location_id"
+# and add an extra join through public.locations where needed.
+_SUB_COMPANY_COL = "company_id"                            # ← VERIFY
+
+# Stripe customer_id column in the subscription table (used to join raw charges).
+_SUB_CUSTOMER_COL = "customer"                             # ← VERIFY (may be customer_id)
+
+# Company/location join column in stripe_transactions (for Signal 6).
+_TXN_COMPANY_COL = "company_id"                            # ← VERIFY
+
+# Status values in stripe_transactions that represent a failed payment.
+# Stripe uses 'failed'; some enriched layers rename it.
+_FAILED_STATUSES = "('failed', 'payment_failed', 'uncollectible')"
+
+# Column on the raw charge table that holds the card fingerprint.
+# In Stripe's flattened schema this is commonly one of:
+#   payment_method_details_card_fingerprint
+#   card_fingerprint
+#   fingerprint
+_FINGERPRINT_COL = "payment_method_details_card_fingerprint"  # ← VERIFY
+
+
 # ---------------------------------------------------------------------------
-# Signal 6 — Failed / Unsuccessful Billing  (PENDING — needs table names)
+# Signal 6 — Failed / Unsuccessful Billing
 # ---------------------------------------------------------------------------
 
 def check_failed_billing(company_id: int) -> Dict[str, Any]:
     """
-    ALERT if the company has any unsuccessful billing attempts from Stripe.
+    ALERT if the company has any failed payment attempts recorded in
+    prod_enriched.stripe.stripe_transactions.
 
-    STATUS: Pending — need to confirm the Stripe billing table name
-    (e.g. postgres.stripe_charges, postgres.biller_charges, ext_stripe.charges).
+    Amounts are stored in cents in Stripe → divided by 100 for display.
     """
-    return _pending(
-        "Awaiting Stripe table confirmation. "
-        "Please share the table name for failed billing attempts "
-        "(e.g. postgres.stripe_charges or a similar table)."
-    )
-
-
-# ---------------------------------------------------------------------------
-# Signal 7 — Billing Disputes  (PENDING — needs table names)
-# ---------------------------------------------------------------------------
-
-def check_billing_disputes(company_id: int) -> Dict[str, Any]:
-    """
-    ALERT if the company has any open or resolved billing disputes.
-
-    STATUS: Pending — need the Stripe disputes table name
-    (e.g. postgres.stripe_disputes, ext_stripe.disputes).
-    """
-    return _pending(
-        "Awaiting Stripe disputes table confirmation. "
-        "Please share the table name for billing disputes."
-    )
-
-
-# ---------------------------------------------------------------------------
-# Signal 8 — Excessive Payment Method Changes  (PENDING — needs table names)
-# ---------------------------------------------------------------------------
-
-def check_payment_method_changes(company_id: int) -> Dict[str, Any]:
-    """
-    ALERT if the company has changed their payment method more than 2 times —
-    may indicate card testing or identity fraud.
-
-    STATUS: Pending — need the payment methods change-log table name
-    (e.g. postgres.stripe_payment_methods, postgres.biller_payment_methods).
-    """
-    return _pending(
-        "Awaiting Stripe payment methods table confirmation. "
-        "Please share the table name for payment method history."
-    )
-
-
-# ---------------------------------------------------------------------------
-# Signal 9 — Stripe Fingerprint Reuse Across Companies
-# ---------------------------------------------------------------------------
-#
-# HOW TO ACTIVATE THIS SIGNAL
-# ────────────────────────────
-# 1. Confirm the table and column names:
-#      TABLE   : e.g.  postgres.stripe_payment_methods  OR  postgres.biller_payment_methods
-#      COLUMNS : fingerprint  (Stripe card fingerprint, same value for the same card number
-#                              regardless of expiry or CVV changes)
-#                company_id   (or an owner_id that maps to a company via locations)
-#                created_at
-#
-# 2. Replace both _STRIPE_PM_TABLE placeholder strings below with the real table name.
-# 3. If the table links to locations instead of companies directly, adjust the join
-#    pattern to go through public.locations first (see the commented-out variant).
-# 4. Delete the _pending() return and uncomment the try/except block.
-#
-# ---------------------------------------------------------------------------
-#
-# FULL QUERY (ready to activate):
-#
-# WITH target_fingerprints AS (
-#     -- Collect every Stripe card fingerprint on file for this company
-#     SELECT DISTINCT
-#         spm.fingerprint,
-#         spm.created_at AS added_to_this_account_at
-#     FROM _STRIPE_PM_TABLE spm
-#     WHERE spm.company_id = {company_id}          -- adjust if joined via location
-#       AND spm.fingerprint IS NOT NULL
-# ),
-# shared_on_other_accounts AS (
-#     -- Find every OTHER company that has ever used the same fingerprint
-#     SELECT
-#         spm.fingerprint,
-#         c.company_id    AS other_company_id,
-#         c.name          AS other_company_name,
-#         MIN(CAST(spm.created_at AS TIMESTAMP)) AS first_seen_at_other_account
-#     FROM _STRIPE_PM_TABLE spm
-#     INNER JOIN public.companies c ON c.company_id = spm.company_id
-#     INNER JOIN target_fingerprints tf ON tf.fingerprint = spm.fingerprint
-#     WHERE spm.company_id != {company_id}
-#       AND c.company_id    != 1987234
-#     GROUP BY spm.fingerprint, c.company_id, c.name
-# )
-# SELECT
-#     s.fingerprint,
-#     s.other_company_id,
-#     s.other_company_name,
-#     s.first_seen_at_other_account,
-#     tf.added_to_this_account_at
-# FROM shared_on_other_accounts s
-# INNER JOIN target_fingerprints tf ON tf.fingerprint = s.fingerprint
-# ORDER BY s.first_seen_at_other_account DESC
-#
-# ---------------------------------------------------------------------------
-
-_STRIPE_PM_TABLE = "PENDING_TABLE_NAME"  # ← replace with real table name
-
-
-def check_fingerprint_reuse(company_id: int) -> Dict[str, Any]:
-    """
-    ALERT if any Stripe card fingerprint on this company's account also appears
-    on one or more OTHER company accounts.
-
-    This is a cross-company signal — the same physical card (same fingerprint)
-    being used to pay for multiple separate accounts is a strong indicator of
-    a fraud ring, bulk account creation, or account takeover.
-
-    Note: Stripe fingerprints are stable across card re-issues with new expiry
-    dates, so a match here is highly reliable.
-
-    STATUS: Pending — awaiting Stripe payment methods table name and column layout.
-    """
-    if _STRIPE_PM_TABLE == "PENDING_TABLE_NAME":
-        return _pending(
-            "Awaiting Stripe payment methods table name. "
-            "Please confirm the table that stores Stripe card fingerprints "
-            "(e.g. postgres.stripe_payment_methods or postgres.biller_payment_methods) "
-            "and whether it links to company_id directly or via location_id."
-        )
-
-    # ── Activated once table name is set above ────────────────────────────
     sql = f"""
-    WITH target_fingerprints AS (
-        SELECT DISTINCT
-            spm.fingerprint,
-            CAST(spm.created_at AS TIMESTAMP) AS added_to_this_account_at
-        FROM {_STRIPE_PM_TABLE} spm
-        WHERE spm.company_id   = {company_id}
-          AND spm.fingerprint IS NOT NULL
-    ),
-    shared_on_other_accounts AS (
-        SELECT
-            spm.fingerprint,
-            c.company_id  AS other_company_id,
-            c.name        AS other_company_name,
-            MIN(CAST(spm.created_at AS TIMESTAMP)) AS first_seen_at_other_account
-        FROM {_STRIPE_PM_TABLE} spm
-        INNER JOIN public.companies c ON c.company_id = spm.company_id
-        INNER JOIN target_fingerprints tf ON tf.fingerprint = spm.fingerprint
-        WHERE spm.company_id != {company_id}
-          AND c.company_id    != 1987234
-        GROUP BY spm.fingerprint, c.company_id, c.name
-    )
     SELECT
-        s.fingerprint,
-        s.other_company_id,
-        s.other_company_name,
-        s.first_seen_at_other_account,
-        tf.added_to_this_account_at
-    FROM shared_on_other_accounts s
-    INNER JOIN target_fingerprints tf ON tf.fingerprint = s.fingerprint
-    ORDER BY s.first_seen_at_other_account DESC
+        t.id                            AS transaction_id,
+        ROUND(t.amount / 100.0, 2)      AS amount_usd,
+        UPPER(t.currency)               AS currency,
+        t.status,
+        COALESCE(t.failure_code,    'n/a') AS failure_code,
+        COALESCE(t.failure_message, 'n/a') AS failure_message,
+        t.invoice_id,
+        t.subscription_id,
+        CAST(t.created AS TIMESTAMP)    AS charged_at
+    FROM {_TXN_TABLE} t
+    WHERE t.{_TXN_COMPANY_COL} = {company_id}
+      AND t.status IN {_FAILED_STATUSES}
+    ORDER BY t.created DESC
     """
     try:
         df      = run_query(sql)
         count   = len(df)
         flagged = count > 0
 
-        # Unique fingerprints and companies in the result for the summary message
-        n_prints   = df["fingerprint"].nunique()       if flagged else 0
-        n_accounts = df["other_company_id"].nunique()  if flagged else 0
+        if flagged:
+            total_usd = df["amount_usd"].sum() if "amount_usd" in df.columns else 0
+            msg = (
+                f"{count} failed billing attempt{'s' if count != 1 else ''} "
+                f"(total exposure: ${total_usd:,.2f})"
+            )
+        else:
+            msg = "No failed billing attempts found"
+
+        return _result("ALERT" if flagged else "CLEAR", msg, df, count)
+    except Exception as exc:
+        return _error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Signal 7 — Billing Disputes
+# ---------------------------------------------------------------------------
+#
+# In Stripe's data model, a disputed charge has disputed = true on the charge
+# object. We link company_id → Stripe customer via stripe_subscription, then
+# pull all charges for that customer where disputed is true.
+#
+# If your charge table uses a different column for disputes (e.g. dispute IS
+# NOT NULL, or amount_refunded > 0), adjust the WHERE clause below.
+# ---------------------------------------------------------------------------
+
+def check_billing_disputes(company_id: int) -> Dict[str, Any]:
+    """
+    ALERT if any Stripe charge linked to this company has been disputed.
+
+    Join path: company_id → stripe_subscription.customer → charge.customer
+    """
+    sql = f"""
+    WITH company_customers AS (
+        -- Map the target company to its Stripe customer ID(s)
+        SELECT DISTINCT {_SUB_CUSTOMER_COL} AS stripe_customer
+        FROM {_SUB_TABLE}
+        WHERE {_SUB_COMPANY_COL} = {company_id}
+          AND {_SUB_CUSTOMER_COL} IS NOT NULL
+    )
+    SELECT
+        c.id                            AS charge_id,
+        ROUND(c.amount        / 100.0, 2) AS charge_amount_usd,
+        ROUND(c.amount_disputed / 100.0, 2) AS disputed_amount_usd,
+        UPPER(c.currency)               AS currency,
+        c.status                        AS charge_status,
+        CAST(c.created AS TIMESTAMP)    AS charged_at,
+        c.{_SUB_CUSTOMER_COL}           AS stripe_customer
+    FROM {_CHG_TABLE} c
+    INNER JOIN company_customers cc
+      ON cc.stripe_customer = c.{_SUB_CUSTOMER_COL}
+    WHERE c.disputed = true
+    ORDER BY c.created DESC
+    """
+    try:
+        df      = run_query(sql)
+        count   = len(df)
+        flagged = count > 0
+
+        if flagged:
+            disputed_usd = (
+                df["disputed_amount_usd"].sum()
+                if "disputed_amount_usd" in df.columns else 0
+            )
+            msg = (
+                f"{count} disputed charge{'s' if count != 1 else ''} "
+                f"(total disputed: ${disputed_usd:,.2f})"
+            )
+        else:
+            msg = "No billing disputes found"
+
+        return _result("ALERT" if flagged else "CLEAR", msg, df, count)
+    except Exception as exc:
+        return _error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Signal 8 — Excessive Payment Method Changes
+# ---------------------------------------------------------------------------
+#
+# We pull every distinct default_payment_method seen across all subscription
+# records for this company. More than 2 distinct values is the alert threshold.
+#
+# If the column is named differently (e.g. payment_method, default_source),
+# update _PM_COL below.
+# ---------------------------------------------------------------------------
+
+_PM_COL     = "default_payment_method"   # ← VERIFY (may be payment_method)
+_PM_THRESHOLD = 2                        # alert when distinct methods > this
+
+
+def check_payment_method_changes(company_id: int) -> Dict[str, Any]:
+    """
+    ALERT if the company has used more than 2 distinct Stripe payment methods
+    across their subscription history — may indicate card testing or fraud.
+    """
+    sql = f"""
+    SELECT
+        s.id                                    AS subscription_id,
+        s.{_PM_COL}                             AS payment_method_id,
+        s.status                                AS subscription_status,
+        CAST(s.current_period_start AS TIMESTAMP) AS period_start,
+        CAST(s.current_period_end   AS TIMESTAMP) AS period_end,
+        CAST(s.created              AS TIMESTAMP) AS created_at
+    FROM {_SUB_TABLE} s
+    WHERE s.{_SUB_COMPANY_COL} = {company_id}
+      AND s.{_PM_COL}          IS NOT NULL
+    ORDER BY s.created DESC
+    """
+    try:
+        df = run_query(sql)
+
+        if df.empty:
+            return _result("CLEAR", "No subscription payment method history found", df, 0)
+
+        distinct_pms = (
+            df["payment_method_id"].nunique()
+            if "payment_method_id" in df.columns else 0
+        )
+        flagged = distinct_pms > _PM_THRESHOLD
 
         msg = (
-            f"{n_prints} fingerprint{'s' if n_prints != 1 else ''} matched on "
+            f"{distinct_pms} distinct payment methods on record — "
+            f"exceeds threshold of {_PM_THRESHOLD}"
+            if flagged else
+            f"{distinct_pms} distinct payment method{'s' if distinct_pms != 1 else ''} — within normal range"
+        )
+        return _result("ALERT" if flagged else "CLEAR", msg, df, distinct_pms)
+    except Exception as exc:
+        return _error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Signal 9 — Stripe Card Fingerprint Reuse Across Companies
+# ---------------------------------------------------------------------------
+#
+# Join path for both sides of the cross-company check:
+#   company_id  →  stripe_subscription.customer
+#              →  charge.customer
+#              →  charge.[_FINGERPRINT_COL]
+#
+# If _FINGERPRINT_COL doesn't exist in prod_raw.stripe.charge, run:
+#   SELECT * FROM prod_raw.stripe.charge LIMIT 1
+# and look for a column containing 'fingerprint'.
+# ---------------------------------------------------------------------------
+
+def check_fingerprint_reuse(company_id: int) -> Dict[str, Any]:
+    """
+    ALERT if any Stripe card fingerprint used by this company also appears on
+    charges belonging to one or more OTHER companies.
+
+    The same physical card (same fingerprint) funding multiple separate accounts
+    is a strong indicator of a fraud ring or bulk account creation.
+    Fingerprints are stable across card re-issues (new expiry / CVV), so a
+    match here is highly reliable.
+
+    Join path: company → stripe_subscription.customer → charge → fingerprint
+    """
+    sql = f"""
+    WITH target_customers AS (
+        -- Stripe customer IDs belonging to the target company
+        SELECT DISTINCT {_SUB_CUSTOMER_COL} AS stripe_customer
+        FROM {_SUB_TABLE}
+        WHERE {_SUB_COMPANY_COL} = {company_id}
+          AND {_SUB_CUSTOMER_COL} IS NOT NULL
+    ),
+    target_fingerprints AS (
+        -- Every distinct card fingerprint ever charged to this company
+        SELECT DISTINCT
+            c.{_FINGERPRINT_COL}            AS fingerprint,
+            MIN(CAST(c.created AS TIMESTAMP)) AS first_used_on_this_account
+        FROM {_CHG_TABLE} c
+        INNER JOIN target_customers tc ON tc.stripe_customer = c.{_SUB_CUSTOMER_COL}
+        WHERE c.{_FINGERPRINT_COL} IS NOT NULL
+        GROUP BY c.{_FINGERPRINT_COL}
+    ),
+    other_company_customers AS (
+        -- Stripe customer IDs for all OTHER companies (for cross-join)
+        SELECT DISTINCT
+            s.{_SUB_CUSTOMER_COL} AS stripe_customer,
+            s.{_SUB_COMPANY_COL}  AS other_company_id
+        FROM {_SUB_TABLE} s
+        WHERE s.{_SUB_COMPANY_COL} != {company_id}
+          AND s.{_SUB_COMPANY_COL} != 1987234
+          AND s.{_SUB_CUSTOMER_COL} IS NOT NULL
+    ),
+    matched_other_accounts AS (
+        -- Other companies whose charges share a fingerprint with the target
+        SELECT
+            c.{_FINGERPRINT_COL}              AS fingerprint,
+            occ.other_company_id,
+            co.name                           AS other_company_name,
+            MIN(CAST(c.created AS TIMESTAMP)) AS first_seen_at_other_account
+        FROM {_CHG_TABLE} c
+        INNER JOIN other_company_customers occ
+          ON occ.stripe_customer = c.{_SUB_CUSTOMER_COL}
+        INNER JOIN public.companies co
+          ON co.company_id = occ.other_company_id
+        INNER JOIN target_fingerprints tf
+          ON tf.fingerprint = c.{_FINGERPRINT_COL}
+        WHERE c.{_FINGERPRINT_COL} IS NOT NULL
+        GROUP BY c.{_FINGERPRINT_COL}, occ.other_company_id, co.name
+    )
+    SELECT
+        m.fingerprint,
+        m.other_company_id,
+        m.other_company_name,
+        m.first_seen_at_other_account,
+        tf.first_used_on_this_account
+    FROM matched_other_accounts m
+    INNER JOIN target_fingerprints tf ON tf.fingerprint = m.fingerprint
+    ORDER BY m.first_seen_at_other_account DESC
+    """
+    try:
+        df      = run_query(sql)
+        count   = len(df)
+        flagged = count > 0
+
+        n_prints   = df["fingerprint"].nunique()      if flagged else 0
+        n_accounts = df["other_company_id"].nunique() if flagged else 0
+
+        msg = (
+            f"{n_prints} card fingerprint{'s' if n_prints != 1 else ''} matched across "
             f"{n_accounts} other company account{'s' if n_accounts != 1 else ''}"
             if flagged else
             "No shared card fingerprints detected across other accounts"
