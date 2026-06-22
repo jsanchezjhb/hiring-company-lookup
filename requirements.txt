@@ -1,7 +1,4 @@
 # Fraud Detection App — Python dependencies
-# Install locally:  pip install -r requirements.txt
-# In Databricks Apps the connector is pre-installed; the rest are auto-resolved.
-
 streamlit>=1.35.0
-databricks-sql-connector>=3.3.0
+databricks-sdk>=0.28.0
 pandas>=2.0.0
