@@ -1,9 +1,9 @@
 """
-db_utils.py — Database connection matching the functional billing-disputes app.
+db_utils.py — Connects using the logged-in user's token via User Authorization.
 
-Uses WorkspaceClient() with DATABRICKS_CLIENT_ID + DATABRICKS_CLIENT_SECRET.
-User Authorization must be OFF — having it on injects DATABRICKS_TOKEN which
-conflicts with the OAuth credentials and breaks the SDK.
+The user's OAuth token (X-Forwarded-Access-Token) is injected by Databricks
+Apps when User Authorization is enabled. Queries run as that user, inheriting
+their personal Unity Catalog permissions — no service principal grants needed.
 """
 
 import os
@@ -14,47 +14,42 @@ _HOST      = os.environ.get("DATABRICKS_HOST",         "").strip()
 _HTTP_PATH = os.environ.get("SQL_WAREHOUSE_HTTP_PATH", "").strip()
 
 
-@st.cache_resource(show_spinner=False)
-def _sdk_client():
-    """Cached WorkspaceClient using service principal OAuth M2M."""
-    from databricks.sdk import WorkspaceClient
-    return WorkspaceClient()
-
-
-def _warehouse_id() -> str:
-    wid = _HTTP_PATH.rstrip("/").split("/")[-1]
-    if not wid or wid == "YOUR_WAREHOUSE_ID_HERE":
-        raise RuntimeError(
-            "SQL_WAREHOUSE_HTTP_PATH is not configured. "
-            "Set it to /sql/1.0/warehouses/16984dfe9a2c3705 in your app environment."
-        )
-    return wid
+def _get_token() -> str:
+    try:
+        t = st.context.headers.get("X-Forwarded-Access-Token", "").strip()
+        if t:
+            return t
+    except AttributeError:
+        pass
+    return os.environ.get("DATABRICKS_TOKEN", "").strip()
 
 
 def run_query(sql_text: str) -> pd.DataFrame:
-    """Execute SQL via the Databricks SDK Statement Execution API."""
-    from databricks.sdk.service.sql import StatementState
+    from databricks import sql as dbsql
 
-    w   = _sdk_client()
-    wid = _warehouse_id()
+    token = _get_token()
+    if not token:
+        raise RuntimeError(
+            "No user token found. "
+            "Enable User Authorization in Apps → Edit → User Authorization."
+        )
 
-    resp = w.statement_execution.execute_statement(
-        statement=sql_text,
-        warehouse_id=wid,
-        wait_timeout="50s",
+    # credentials_provider passes the OAuth JWT as a Bearer header.
+    # This is the correct approach for OAuth tokens — access_token only
+    # works for PAT tokens (dapi...), not OAuth JWTs (eyJ...).
+    def _creds():
+        return {"Authorization": f"Bearer {token}"}
+
+    conn = dbsql.connect(
+        server_hostname=_HOST,
+        http_path=_HTTP_PATH,
+        credentials_provider=_creds,
     )
-
-    state     = resp.status.state if resp.status else None
-    state_str = state.value if hasattr(state, "value") else str(state)
-
-    if state_str != "SUCCEEDED":
-        error = getattr(resp.status, "error", None)
-        msg   = error.message if error else state_str
-        raise Exception(f"Query failed [{state_str}]: {msg}")
-
-    if not resp.result or not resp.result.data_array:
-        return pd.DataFrame()
-
-    columns = [col.name for col in resp.manifest.schema.columns]
-    rows    = [list(row) for row in resp.result.data_array]
-    return pd.DataFrame(rows, columns=columns)
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(sql_text)
+            rows = cursor.fetchall()
+            cols = [d[0] for d in cursor.description] if cursor.description else []
+            return pd.DataFrame(rows, columns=cols)
+    finally:
+        conn.close()
