@@ -20,4 +20,4 @@ command:
 # Paste it as the value below, then redeploy.
 env:
   - name: SQL_WAREHOUSE_HTTP_PATH
-    value: "/sql/1.0/warehouses/YOUR_WAREHOUSE_ID_HERE"
+    value: "/sql/1.0/warehouses/16984dfe9a2c3705"
