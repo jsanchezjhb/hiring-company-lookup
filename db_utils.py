@@ -1,65 +1,52 @@
 """
-db_utils.py — Database connection for the Fraud Detection App.
+db_utils.py — Database connection via direct REST API calls.
 
-The Databricks Apps platform injects DATABRICKS_TOKEN (set to the user's
-token when User Authorization is on) alongside DATABRICKS_CLIENT_ID and
-DATABRICKS_CLIENT_SECRET. The SDK sees two auth methods and refuses to start.
+Bypasses the Databricks SDK's Config validation entirely, which was causing
+"two auth methods" conflicts between DATABRICKS_TOKEN and OAuth credentials.
 
-Fix: save any PAT value before it's removed, always clear DATABRICKS_TOKEN
-from the environment, then manage auth explicitly in _sdk_client().
+Auth priority:
+  1. X-Forwarded-Access-Token header  — user's token (User Authorization)
+  2. DATABRICKS_TOKEN env var         — PAT for local dev
+  3. OAuth M2M via OIDC endpoint      — service principal (production fallback)
 """
 
 import os
+import requests
 import streamlit as st
 import pandas as pd
 
-# Save PAT value before cleanup — non-empty only in local dev
-_saved_pat = os.environ.get("DATABRICKS_TOKEN", "").strip()
-
-# Always clear DATABRICKS_TOKEN so the SDK never sees it alongside
-# the OAuth credentials. Auth is handled explicitly below.
-os.environ.pop("DATABRICKS_TOKEN", None)
+_HOST = os.environ.get("DATABRICKS_HOST", "").strip()
 
 
-# ---------------------------------------------------------------------------
-# Client
-# ---------------------------------------------------------------------------
+def _get_token() -> str:
+    """Return the best available auth token."""
 
-def _sdk_client():
-    """
-    Build a WorkspaceClient using explicit credentials — no auto-discovery.
-
-    Priority:
-      1. X-Forwarded-Access-Token header  →  user's token (User Authorization)
-      2. Saved PAT                        →  local dev
-      3. No token                         →  OAuth M2M via env vars (production)
-    """
-    from databricks.sdk import WorkspaceClient
-
-    host = os.environ.get("DATABRICKS_HOST", "").strip()
-
-    # 1. User Authorization header (Databricks Apps)
-    user_token = ""
+    # 1. User Authorization (Databricks Apps injects this per-user)
     try:
-        user_token = st.context.headers.get("X-Forwarded-Access-Token", "")
+        token = st.context.headers.get("X-Forwarded-Access-Token", "")
+        if token:
+            return token
     except AttributeError:
         pass
 
-    if user_token:
-        return WorkspaceClient(host=host, token=user_token)
-
     # 2. PAT for local dev
-    if _saved_pat:
-        return WorkspaceClient(host=host, token=_saved_pat)
+    pat = os.environ.get("DATABRICKS_TOKEN", "").strip()
+    if pat:
+        return pat
 
-    # 3. OAuth M2M — DATABRICKS_CLIENT_ID + SECRET are still in env,
-    #    DATABRICKS_TOKEN is gone, so no conflict
-    return WorkspaceClient()
+    # 3. OAuth M2M — fetch token from OIDC endpoint
+    client_id     = os.environ.get("DATABRICKS_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("DATABRICKS_CLIENT_SECRET", "").strip()
 
+    resp = requests.post(
+        f"https://{_HOST}/oidc/v1/token",
+        auth=(client_id, client_secret),
+        data={"grant_type": "client_credentials", "scope": "all-apis"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["access_token"]
 
-# ---------------------------------------------------------------------------
-# Warehouse ID
-# ---------------------------------------------------------------------------
 
 def _warehouse_id() -> str:
     path = os.environ.get("SQL_WAREHOUSE_HTTP_PATH", "").rstrip("/")
@@ -72,33 +59,34 @@ def _warehouse_id() -> str:
     return wid
 
 
-# ---------------------------------------------------------------------------
-# Query runner
-# ---------------------------------------------------------------------------
-
 def run_query(sql_text: str) -> pd.DataFrame:
-    from databricks.sdk.service.sql import StatementState
+    """Execute SQL via the Databricks Statement Execution REST API."""
+    token = _get_token()
+    wid   = _warehouse_id()
 
-    w   = _sdk_client()
-    wid = _warehouse_id()
-
-    resp = w.statement_execution.execute_statement(
-        statement=sql_text,
-        warehouse_id=wid,
-        wait_timeout="50s",
+    resp = requests.post(
+        f"https://{_HOST}/api/2.0/sql/statements",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "statement":   sql_text,
+            "warehouse_id": wid,
+            "wait_timeout": "50s",
+            "disposition":  "INLINE",
+            "format":       "JSON_ARRAY",
+        },
+        timeout=60,
     )
+    resp.raise_for_status()
+    data = resp.json()
 
-    state     = resp.status.state if resp.status else None
-    state_str = state.value if hasattr(state, "value") else str(state)
+    state = data.get("status", {}).get("state", "UNKNOWN")
+    if state != "SUCCEEDED":
+        error = data.get("status", {}).get("error", {})
+        raise Exception(f"Query failed [{state}]: {error.get('message', state)}")
 
-    if state_str != "SUCCEEDED":
-        error = getattr(resp.status, "error", None)
-        msg   = error.message if error else state_str
-        raise Exception(f"Query failed [{state_str}]: {msg}")
-
-    if not resp.result or not resp.result.data_array:
+    result = data.get("result", {})
+    if not result or not result.get("data_array"):
         return pd.DataFrame()
 
-    columns = [col.name for col in resp.manifest.schema.columns]
-    rows    = [list(row) for row in resp.result.data_array]
-    return pd.DataFrame(rows, columns=columns)
+    columns = [col["name"] for col in data["manifest"]["schema"]["columns"]]
+    return pd.DataFrame(result["data_array"], columns=columns)
