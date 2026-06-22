@@ -43,16 +43,13 @@ def run_query(sql_text: str) -> pd.DataFrame:
             "Enable User Authorization in Apps → Edit → User Authorization."
         )
 
-    # Build credentials_provider matching the working billing-disputes app pattern:
-    #   credentials_provider = lambda: cfg.authenticate
-    # where cfg.authenticate is called with (headers_dict) and modifies it in place.
-    #
-    # We replicate that two-level callable without instantiating Config,
-    # which would conflict with DATABRICKS_CLIENT_ID/SECRET in the environment
-    # even when an explicit token is passed.
+    # credentials_provider must be a two-level callable:
+    #   provider()  → returns header_factory
+    #   header_factory()  → returns {"Authorization": "Bearer <token>"}
+    # (HeaderFactory = Callable[[], Dict[str, str]] in databricks-sql-connector 3.1.0)
     def _provider():
-        def _factory(headers: dict) -> None:
-            headers["Authorization"] = f"Bearer {token}"
+        def _factory() -> dict:
+            return {"Authorization": f"Bearer {token}"}
         return _factory
 
     conn = dbsql.connect(
