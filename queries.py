@@ -12,8 +12,8 @@ Status values:
   "ERROR"   — query failed (detail in message)
 
 Table notes (Databricks / Spark SQL):
-  - hiring_job_requests.created_at  → microsecond epoch  → TIMESTAMP_MICROS()
-  - hiring_job_requests.activated_at → regular timestamp, no conversion needed
+  - hiring_job_requests.created_at  → already a TIMESTAMP (no conversion needed)
+  - hiring_job_requests.activated_at → regular timestamp
   - Always filter hiring_version = 2
   - Always exclude test company 1987234
   - Job scope: company_id → public.locations → postgres.hiring_job_requests
@@ -31,12 +31,6 @@ from db_utils import run_query
 # ---------------------------------------------------------------------------
 
 EXCLUDE_TEST_COMPANY = "AND c.company_id != 1987234"
-
-# Microsecond constants
-_MICROS_PER_SECOND = 1_000_000
-_MICROS_PER_MINUTE = 60 * _MICROS_PER_SECOND
-_MICROS_PER_HOUR   = 60 * _MICROS_PER_MINUTE
-_MICROS_PER_DAY    = 24 * _MICROS_PER_HOUR  # 86_400_000_000
 
 
 def _result(status: str, message: str, df: pd.DataFrame, count: int | None = None) -> Dict[str, Any]:
@@ -91,7 +85,7 @@ def check_active_job_posts(company_id: int) -> Dict[str, Any]:
         hjr.id                                          AS job_post_id,
         hjr.title                                       AS job_title,
         hjr.status,
-        CAST(TIMESTAMP_MICROS(hjr.created_at) AS DATE)  AS created_date,
+        CAST(hjr.created_at AS DATE)                    AS created_date,
         CAST(hjr.activated_at AS TIMESTAMP)             AS activated_at,
         l.location_id,
         l.name                                          AS location_name,
@@ -127,27 +121,22 @@ def check_active_job_posts(company_id: int) -> Dict[str, Any]:
 def check_rapid_postings(company_id: int) -> Dict[str, Any]:
     """
     ALERT if any two consecutive job posts from this company were created
-    less than 60 seconds apart — a pattern consistent with automation or bulk fraud.
-
-    Method: LAG() over the raw microsecond created_at to avoid timestamp
-    conversion in the WHERE clause. 1 minute = 60,000,000 microseconds.
+    less than 60 seconds apart — consistent with automation or bulk fraud.
+    created_at is a TIMESTAMP; gap is computed with UNIX_TIMESTAMP().
     """
-    THRESHOLD_MICROS = 60 * _MICROS_PER_SECOND  # 60_000_000
-
     sql = f"""
     WITH job_sequence AS (
         SELECT
-            hjr.id                                         AS job_post_id,
-            hjr.title                                      AS job_title,
+            hjr.id          AS job_post_id,
+            hjr.title       AS job_title,
             hjr.status,
-            hjr.created_at                                 AS created_at_micros,
-            TIMESTAMP_MICROS(hjr.created_at)               AS created_at,
+            hjr.created_at,
             LAG(hjr.created_at) OVER (
                 PARTITION BY c.company_id
                 ORDER BY hjr.created_at ASC
-            )                                              AS prev_created_at_micros,
+            )               AS prev_created_at,
             l.location_id,
-            l.name                                         AS location_name
+            l.name          AS location_name
         FROM postgres.hiring_job_requests hjr
         INNER JOIN public.locations  l ON l.location_id = hjr.location_id
         INNER JOIN public.companies  c ON c.company_id  = l.company_id
@@ -162,18 +151,16 @@ def check_rapid_postings(company_id: int) -> Dict[str, Any]:
         job_title,
         status,
         created_at,
-        TIMESTAMP_MICROS(prev_created_at_micros)            AS prev_job_created_at,
-        CAST(
-            (created_at_micros - prev_created_at_micros) / {_MICROS_PER_SECOND}
-        AS INT)                                             AS seconds_between_posts,
-        ROUND(
-            (created_at_micros - prev_created_at_micros) / {_MICROS_PER_MINUTE}.0,
-        2)                                                  AS minutes_between_posts,
+        prev_created_at,
+        CAST(UNIX_TIMESTAMP(created_at) - UNIX_TIMESTAMP(prev_created_at) AS INT)
+                        AS seconds_between_posts,
+        ROUND((UNIX_TIMESTAMP(created_at) - UNIX_TIMESTAMP(prev_created_at)) / 60.0, 2)
+                        AS minutes_between_posts,
         location_id,
         location_name
     FROM job_sequence
-    WHERE prev_created_at_micros IS NOT NULL
-        AND (created_at_micros - prev_created_at_micros) < {THRESHOLD_MICROS}
+    WHERE prev_created_at IS NOT NULL
+        AND (UNIX_TIMESTAMP(created_at) - UNIX_TIMESTAMP(prev_created_at)) < 60
     ORDER BY created_at DESC
     """
     try:
@@ -209,8 +196,8 @@ def check_hourly_burst(company_id: int) -> Dict[str, Any]:
             hjr.id                                             AS job_post_id,
             hjr.title                                          AS job_title,
             hjr.status,
-            TIMESTAMP_MICROS(hjr.created_at)                   AS created_at,
-            DATE_TRUNC('HOUR', TIMESTAMP_MICROS(hjr.created_at)) AS hour_bucket,
+            hjr.created_at                                   AS created_at,
+            DATE_TRUNC('HOUR', hjr.created_at)               AS hour_bucket,
             l.location_id,
             l.name                                             AS location_name
         FROM postgres.hiring_job_requests hjr
@@ -465,29 +452,22 @@ def check_ip_location_mismatch(company_id: int) -> Dict[str, Any]:
 
 def check_dormancy_reactivation(company_id: int) -> Dict[str, Any]:
     """
-    ALERT if the company posted a job after a gap of 30+ days with no
-    posting activity — a pattern consistent with account takeover or
-    a reactivated fraud ring.
-
-    Method: LAG() on raw microsecond created_at.
-    30 days = 2,592,000,000,000 microseconds.
+    ALERT if the company posted a job after a gap of 30+ days with no activity.
+    created_at is a TIMESTAMP; gap is computed with DATEDIFF().
     """
-    THRESHOLD_MICROS = 30 * _MICROS_PER_DAY  # 2_592_000_000_000
-
     sql = f"""
     WITH job_sequence AS (
         SELECT
-            hjr.id                                         AS job_post_id,
-            hjr.title                                      AS job_title,
+            hjr.id          AS job_post_id,
+            hjr.title       AS job_title,
             hjr.status,
-            hjr.created_at                                 AS created_at_micros,
-            TIMESTAMP_MICROS(hjr.created_at)               AS created_at,
+            hjr.created_at,
             LAG(hjr.created_at) OVER (
                 PARTITION BY c.company_id
                 ORDER BY hjr.created_at ASC
-            )                                              AS prev_created_at_micros,
+            )               AS prev_created_at,
             l.location_id,
-            l.name                                         AS location_name
+            l.name          AS location_name
         FROM postgres.hiring_job_requests hjr
         INNER JOIN public.locations  l ON l.location_id = hjr.location_id
         INNER JOIN public.companies  c ON c.company_id  = l.company_id
@@ -501,16 +481,14 @@ def check_dormancy_reactivation(company_id: int) -> Dict[str, Any]:
         job_post_id,
         job_title,
         status,
-        created_at                                          AS resumed_posting_at,
-        TIMESTAMP_MICROS(prev_created_at_micros)            AS last_post_before_gap,
-        CAST(
-            (created_at_micros - prev_created_at_micros) / {_MICROS_PER_DAY}
-        AS INT)                                             AS gap_days,
+        created_at          AS resumed_posting_at,
+        prev_created_at     AS last_post_before_gap,
+        DATEDIFF(created_at, prev_created_at) AS gap_days,
         location_id,
         location_name
     FROM job_sequence
-    WHERE prev_created_at_micros IS NOT NULL
-        AND (created_at_micros - prev_created_at_micros) >= {THRESHOLD_MICROS}
+    WHERE prev_created_at IS NOT NULL
+        AND DATEDIFF(created_at, prev_created_at) >= 30
     ORDER BY created_at DESC
     """
     try:
