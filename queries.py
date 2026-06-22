@@ -43,10 +43,20 @@ def run_query(sql_text: str) -> pd.DataFrame:
             "Enable User Authorization in Apps → Edit → User Authorization."
         )
 
+def run_query(sql_text: str) -> pd.DataFrame:
+    from databricks.sdk.core import Config
+    from databricks import sql as dbsql
+
+    # Exact pattern from the working billing-disputes app:
+    #   cfg = Config()  →  discovers DATABRICKS_CLIENT_ID + SECRET (OAuth M2M)
+    #   credentials_provider=lambda: cfg.authenticate  →  two-level Thrift auth
+    # User Authorization must be OFF so DATABRICKS_TOKEN is not injected
+    # alongside the OAuth credentials (that causes the "two auth methods" conflict).
+    cfg  = Config()
     conn = dbsql.connect(
-        server_hostname=_HOST,
+        server_hostname=cfg.host,
         http_path=_HTTP_PATH,
-        access_token=token,
+        credentials_provider=lambda: cfg.authenticate,
     )
     try:
         with conn.cursor() as cursor:
