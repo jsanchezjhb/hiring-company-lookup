@@ -327,7 +327,7 @@ def check_hourly_burst(company_id: int) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 _IP_SIGNUP_TABLE = "prod_redshift_replica.heap.sign_up_owner_signed_up"
-_LOCATION_TABLE  = "prod_redshift_replica.public.locations"
+_LOCATION_TABLE  = "prod_raw.homebase1.locations"
 
 
 def check_ip_location_mismatch(company_id: int) -> Dict[str, Any]:
@@ -335,15 +335,14 @@ def check_ip_location_mismatch(company_id: int) -> Dict[str, Any]:
     ALERT if the IP address at account creation does not align with the
     company's registered city or state.
 
-    Returns ALL rows (City Match, State Match Only, No Match) so the rep
-    gets the full picture. ALERTs when at least one row is 'No Match'.
-    mismatch_pct is the heuristic likelihood that this is genuine fraud
-    (not a VPN / cloud IP / CDN exit node).
+    Uses the exact working query provided — prod_raw.homebase1.locations
+    with id, city, state, zip, address_1 columns.
+    Returns ALL rows so the rep sees City Match, State Match Only, and No Match.
+    ALERTs when at least one row is 'No Match'.
     """
     sql = f"""
     WITH state_abbrev AS (
-        SELECT abbr, full_name
-        FROM (VALUES
+        SELECT abbr, full_name FROM (VALUES
             ('AL','Alabama'),('AK','Alaska'),('AZ','Arizona'),('AR','Arkansas'),
             ('CA','California'),('CO','Colorado'),('CT','Connecticut'),('DE','Delaware'),
             ('FL','Florida'),('GA','Georgia'),('HI','Hawaii'),('ID','Idaho'),
@@ -369,25 +368,25 @@ def check_ip_location_mismatch(company_id: int) -> Dict[str, Any]:
             company_id,
             location_id,
             ip,
-            city        AS ip_city,
-            region      AS ip_region,
-            country     AS ip_country,
-            time        AS signup_time
+            city    AS ip_city,
+            region  AS ip_region,
+            country AS ip_country,
+            time    AS signup_time
         FROM {_IP_SIGNUP_TABLE}
-        WHERE ip         IS NOT NULL
-          AND company_id  = {company_id}
+        WHERE ip IS NOT NULL
+          AND company_id = {company_id}
     ),
     location_address AS (
         SELECT
-            id           AS location_id,
+            id          AS location_id,
             company_id,
-            city         AS provided_city,
-            state        AS provided_state,
+            city        AS provided_city,
+            state       AS provided_state,
             zip,
             address_1
         FROM {_LOCATION_TABLE}
-        WHERE city        IS NOT NULL
-          AND company_id  = {company_id}
+        WHERE city IS NOT NULL
+          AND company_id = {company_id}
     )
     SELECT
         sg.company_id,
@@ -398,57 +397,42 @@ def check_ip_location_mismatch(company_id: int) -> Dict[str, Any]:
         la.provided_city,
         la.provided_state,
         la.zip,
-        COALESCE(sa_ip.abbr,  LOWER(TRIM(sg.ip_region)))       AS ip_state_normalized,
+        COALESCE(sa_ip.abbr, LOWER(TRIM(sg.ip_region))) AS ip_state_normalized,
         COALESCE(LOWER(sa_loc.full_name), LOWER(TRIM(la.provided_state))) AS provided_state_normalized,
-
         CASE
             WHEN LOWER(TRIM(sg.ip_city)) = LOWER(TRIM(la.provided_city))
                 THEN 'City Match'
-            WHEN COALESCE(LOWER(sa_ip.abbr),  LOWER(TRIM(sg.ip_region)))
+            WHEN COALESCE(LOWER(sa_ip.abbr), LOWER(TRIM(sg.ip_region)))
                = COALESCE(LOWER(la.provided_state), '')
-              OR LOWER(TRIM(sg.ip_region))
-               = COALESCE(LOWER(sa_loc.full_name), '')
+              OR LOWER(TRIM(sg.ip_region)) = COALESCE(LOWER(sa_loc.full_name), '')
                 THEN 'State Match Only'
             ELSE 'No Match'
         END AS location_match_status,
-
         CONCAT(
             CASE
-                WHEN LOWER(TRIM(sg.ip_city)) = LOWER(TRIM(la.provided_city))
-                    THEN '0'
+                WHEN LOWER(TRIM(sg.ip_city)) = LOWER(TRIM(la.provided_city)) THEN '0'
                 WHEN LOWER(la.provided_city) LIKE '%' || LOWER(TRIM(sg.ip_city)) || '%'
                   OR LOWER(TRIM(sg.ip_city)) LIKE '%' || LOWER(TRIM(la.provided_city)) || '%'
                     THEN '10'
-                WHEN LOWER(TRIM(sg.ip_city)) IN (
-                        'ashburn','atlanta','chicago','dallas',
-                        'seattle','los angeles','san jose'
-                     )
-                  AND COALESCE(LOWER(sa_ip.abbr), LOWER(TRIM(sg.ip_region)))
-                   != LOWER(TRIM(la.provided_state))
-                  AND LOWER(TRIM(sg.ip_region))
-                   != COALESCE(LOWER(sa_loc.full_name), '')
+                WHEN LOWER(TRIM(sg.ip_city)) IN ('ashburn','atlanta','chicago','dallas','seattle','los angeles','san jose')
+                  AND COALESCE(LOWER(sa_ip.abbr), LOWER(TRIM(sg.ip_region))) != LOWER(TRIM(la.provided_state))
+                  AND LOWER(TRIM(sg.ip_region)) != COALESCE(LOWER(sa_loc.full_name), '')
                     THEN '25'
-                WHEN COALESCE(LOWER(sa_ip.abbr), LOWER(TRIM(sg.ip_region)))
-                   = LOWER(TRIM(la.provided_state))
+                WHEN COALESCE(LOWER(sa_ip.abbr), LOWER(TRIM(sg.ip_region))) = LOWER(TRIM(la.provided_state))
                   OR LOWER(TRIM(sg.ip_region)) = COALESCE(LOWER(sa_loc.full_name), '')
                     THEN '30'
-                WHEN LOWER(TRIM(sg.ip_country)) = 'united states'     THEN '60'
-                WHEN LOWER(TRIM(sg.ip_country)) = 'canada'            THEN '65'
-                WHEN LOWER(TRIM(sg.ip_country))
-                     NOT IN ('united states','canada')                 THEN '90'
+                WHEN LOWER(TRIM(sg.ip_country)) = 'united states' THEN '60'
+                WHEN LOWER(TRIM(sg.ip_country)) IN ('canada')      THEN '65'
+                WHEN LOWER(TRIM(sg.ip_country)) NOT IN ('united states','canada') THEN '90'
                 ELSE '50'
             END,
             '%'
         ) AS mismatch_pct,
-
         sg.signup_time
     FROM signup_geo sg
-    JOIN location_address la
-      ON sg.company_id = la.company_id
-    LEFT JOIN state_abbrev sa_ip
-      ON LOWER(TRIM(sg.ip_region)) = LOWER(sa_ip.full_name)
-    LEFT JOIN state_abbrev sa_loc
-      ON LOWER(TRIM(la.provided_state)) = LOWER(sa_loc.abbr)
+    JOIN location_address la ON sg.company_id = la.company_id
+    LEFT JOIN state_abbrev sa_ip  ON LOWER(TRIM(sg.ip_region))      = LOWER(sa_ip.full_name)
+    LEFT JOIN state_abbrev sa_loc ON LOWER(TRIM(la.provided_state)) = LOWER(sa_loc.abbr)
     ORDER BY sg.signup_time DESC
     """
     try:
