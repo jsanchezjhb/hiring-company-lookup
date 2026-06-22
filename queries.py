@@ -34,24 +34,40 @@ def _user_token() -> str:
 
 
 def run_query(sql_text: str) -> pd.DataFrame:
-    from databricks.sdk.core import Config
-    from databricks import sql
+    from databricks import sql as dbsql
 
     token = _user_token()
     if not token:
-        raise RuntimeError("No user token. Enable User Authorization in Apps → Edit.")
+        raise RuntimeError(
+            "No user token found. "
+            "Enable User Authorization in Apps → Edit → User Authorization."
+        )
 
-    cfg = Config(host=_HOST, token=token)
-    conn = sql.connect(
-        server_hostname=cfg.host,
+    # Build credentials_provider matching the working billing-disputes app pattern:
+    #   credentials_provider = lambda: cfg.authenticate
+    # where cfg.authenticate is called with (headers_dict) and modifies it in place.
+    #
+    # We replicate that two-level callable without instantiating Config,
+    # which would conflict with DATABRICKS_CLIENT_ID/SECRET in the environment
+    # even when an explicit token is passed.
+    def _provider():
+        def _factory(headers: dict) -> None:
+            headers["Authorization"] = f"Bearer {token}"
+        return _factory
+
+    conn = dbsql.connect(
+        server_hostname=_HOST,
         http_path=_HTTP_PATH,
-        credentials_provider=lambda: cfg.authenticate,
+        credentials_provider=_provider,
     )
-    with conn.cursor() as cursor:
-        cursor.execute(sql_text)
-        rows = cursor.fetchall()
-        cols = [d[0] for d in cursor.description] if cursor.description else []
-        return pd.DataFrame(rows, columns=cols)
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(sql_text)
+            rows = cursor.fetchall()
+            cols = [d[0] for d in cursor.description] if cursor.description else []
+            return pd.DataFrame(rows, columns=cols)
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
