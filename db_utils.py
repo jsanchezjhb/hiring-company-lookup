@@ -1,17 +1,23 @@
 """
 db_utils.py — Database connection for the Fraud Detection App.
 
-With User Authorization enabled in Databricks Apps, each user's requests
-carry their OAuth token in the X-Forwarded-Access-Token header.
-We read that header and pass it to WorkspaceClient so queries run as the
-logged-in user — inheriting their Unity Catalog permissions.
-
-Falls back to environment-based auth (service principal / PAT) for local dev.
+Auth note: Databricks Apps injects DATABRICKS_TOKEN="" (empty string) into
+the environment even when OAuth M2M credentials are present. The SDK treats
+any DATABRICKS_TOKEN entry — even empty — as a PAT auth method, which
+conflicts with DATABRICKS_CLIENT_ID/SECRET (OAuth). We remove it at import
+time if empty so the SDK only sees one auth method.
 """
 
 import os
 import streamlit as st
 import pandas as pd
+
+# Remove empty DATABRICKS_TOKEN before the SDK initialises.
+# Databricks Apps sets this to "" by default; the SDK then sees both PAT
+# (empty token) and OAuth (client_id + client_secret) and refuses to start.
+# Only remove it when empty — a real PAT for local dev is left untouched.
+if not os.environ.get("DATABRICKS_TOKEN", ""):
+    os.environ.pop("DATABRICKS_TOKEN", None)
 
 
 # ---------------------------------------------------------------------------
