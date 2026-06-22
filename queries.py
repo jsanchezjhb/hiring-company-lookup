@@ -327,7 +327,7 @@ def check_hourly_burst(company_id: int) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 _IP_SIGNUP_TABLE = "prod_redshift_replica.heap.sign_up_owner_signed_up"
-_LOCATION_TABLE  = "prod_raw.homebase1.locations"
+_LOCATION_TABLE  = "prod_redshift_replica.postgres.locations"
 
 
 def check_ip_location_mismatch(company_id: int) -> Dict[str, Any]:
