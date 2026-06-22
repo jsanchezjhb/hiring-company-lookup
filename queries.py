@@ -43,19 +43,10 @@ def run_query(sql_text: str) -> pd.DataFrame:
             "Enable User Authorization in Apps → Edit → User Authorization."
         )
 
-    # credentials_provider must be a two-level callable:
-    #   provider()  → returns header_factory
-    #   header_factory()  → returns {"Authorization": "Bearer <token>"}
-    # (HeaderFactory = Callable[[], Dict[str, str]] in databricks-sql-connector 3.1.0)
-    def _provider():
-        def _factory() -> dict:
-            return {"Authorization": f"Bearer {token}"}
-        return _factory
-
     conn = dbsql.connect(
         server_hostname=_HOST,
         http_path=_HTTP_PATH,
-        credentials_provider=_provider,
+        access_token=token,
     )
     try:
         with conn.cursor() as cursor:
