@@ -533,45 +533,51 @@ def check_dormancy_reactivation(company_id: int) -> Dict[str, Any]:
 # Stripe table / column constants
 # ===========================================================================
 # All Stripe signal functions reference these constants.
-# If a column name or table path differs from what's in your workspace,
-# update the constant here — every query that uses it picks up the change.
+# Update a constant here → every query that uses it picks up the change.
 #
 # Tables confirmed from workspace screenshot:
 #   prod_enriched.stripe.stripe_transactions  — tx-level: amount, status, invoices, subscriptions
 #   prod_enriched.stripe.stripe_subscription  — subscription details incl. company/location
 #   prod_raw.stripe.charge                    — raw charge objects (disputed flag, fingerprint)
 #
-# Uncertain column names are marked with ← VERIFY; adjust as needed after
-# running a quick `SELECT * FROM <table> LIMIT 1` in Databricks.
+# Columns marked ✅ confirmed from SELECT * … LIMIT 1 output.
+# Columns marked ← VERIFY still need a quick check against the charge table.
 # ===========================================================================
 
 # Tables
 _TXN_TABLE  = "prod_enriched.stripe.stripe_transactions"   # Signal 6
 _SUB_TABLE  = "prod_enriched.stripe.stripe_subscription"   # Signals 7, 8, 9 (company linkage)
-_CHG_TABLE  = "prod_raw.stripe.charge"                     # Signals 7, 9
+_CHG_TABLE  = "prod_raw.stripe.charge"                     # Signals 7, 8, 9
 
-# Company/location join column in the enriched subscription table.
-# Try company_id first; if the table only has location_id, swap to:
-#   _SUB_COMPANY_COL = "location_id"
-# and add an extra join through public.locations where needed.
-_SUB_COMPANY_COL = "company_id"                            # ← VERIFY
+# stripe_subscription columns — ✅ confirmed from schema output
+_SUB_COMPANY_COL   = "company_id"          # ✅ confirmed
+_SUB_CUSTOMER_COL  = "biller_customer_id"  # ✅ confirmed (Stripe cus_* ID)
 
-# Stripe customer_id column in the subscription table (used to join raw charges).
-_SUB_CUSTOMER_COL = "customer"                             # ← VERIFY (may be customer_id)
+# prod_raw.stripe.charge columns — ← VERIFY (charge LIMIT 1 not yet shared)
+# _CHARGE_CUSTOMER_COL : column on charge that holds the Stripe cus_* ID.
+#   Standard Stripe name is "customer" — check your flattened schema.
+_CHARGE_CUSTOMER_COL = "customer"          # ← VERIFY
 
-# Company/location join column in stripe_transactions (for Signal 6).
-_TXN_COMPANY_COL = "company_id"                            # ← VERIFY
+# Payment method ID column on prod_raw.stripe.charge (Signal 8).
+#   Standard Stripe name is "payment_method" — check your flattened schema.
+_CHARGE_PM_COL = "payment_method"          # ← VERIFY
 
-# Status values in stripe_transactions that represent a failed payment.
-# Stripe uses 'failed'; some enriched layers rename it.
+# Card fingerprint column on prod_raw.stripe.charge (Signal 9).
+#   In Stripe's flattened schema this is commonly one of:
+#     payment_method_details_card_fingerprint
+#     card_fingerprint
+#     fingerprint
+#   Run: SELECT * FROM prod_raw.stripe.charge LIMIT 1 and look for 'fingerprint'.
+_FINGERPRINT_COL = "payment_method_details_card_fingerprint"  # ← VERIFY
+
+# Company/location join column in stripe_transactions (Signal 6).
+_TXN_COMPANY_COL = "company_id"            # ← VERIFY
+
+# Status values that represent a failed payment in stripe_transactions.
 _FAILED_STATUSES = "('failed', 'payment_failed', 'uncollectible')"
 
-# Column on the raw charge table that holds the card fingerprint.
-# In Stripe's flattened schema this is commonly one of:
-#   payment_method_details_card_fingerprint
-#   card_fingerprint
-#   fingerprint
-_FINGERPRINT_COL = "payment_method_details_card_fingerprint"  # ← VERIFY
+# Alert threshold for payment method changes (Signal 8).
+_PM_THRESHOLD = 2                          # alert when distinct methods > this
 
 
 # ---------------------------------------------------------------------------
@@ -636,7 +642,7 @@ def check_billing_disputes(company_id: int) -> Dict[str, Any]:
     """
     ALERT if any Stripe charge linked to this company has been disputed.
 
-    Join path: company_id → stripe_subscription.customer → charge.customer
+    Join path: company_id → stripe_subscription.biller_customer_id → charge.customer
     """
     sql = f"""
     WITH company_customers AS (
@@ -647,16 +653,16 @@ def check_billing_disputes(company_id: int) -> Dict[str, Any]:
           AND {_SUB_CUSTOMER_COL} IS NOT NULL
     )
     SELECT
-        c.id                            AS charge_id,
-        ROUND(c.amount        / 100.0, 2) AS charge_amount_usd,
-        ROUND(c.amount_disputed / 100.0, 2) AS disputed_amount_usd,
-        UPPER(c.currency)               AS currency,
-        c.status                        AS charge_status,
-        CAST(c.created AS TIMESTAMP)    AS charged_at,
-        c.{_SUB_CUSTOMER_COL}           AS stripe_customer
+        c.id                                    AS charge_id,
+        ROUND(c.amount         / 100.0, 2)      AS charge_amount_usd,
+        ROUND(c.amount_disputed / 100.0, 2)     AS disputed_amount_usd,
+        UPPER(c.currency)                       AS currency,
+        c.status                                AS charge_status,
+        CAST(c.created AS TIMESTAMP)            AS charged_at,
+        c.{_CHARGE_CUSTOMER_COL}                AS stripe_customer
     FROM {_CHG_TABLE} c
     INNER JOIN company_customers cc
-      ON cc.stripe_customer = c.{_SUB_CUSTOMER_COL}
+      ON cc.stripe_customer = c.{_CHARGE_CUSTOMER_COL}
     WHERE c.disputed = true
     ORDER BY c.created DESC
     """
@@ -686,46 +692,51 @@ def check_billing_disputes(company_id: int) -> Dict[str, Any]:
 # Signal 8 — Excessive Payment Method Changes
 # ---------------------------------------------------------------------------
 #
-# We pull every distinct default_payment_method seen across all subscription
-# records for this company. More than 2 distinct values is the alert threshold.
+# stripe_subscription does not carry a payment method column, so we derive
+# distinct payment methods from prod_raw.stripe.charge instead.
 #
-# If the column is named differently (e.g. payment_method, default_source),
-# update _PM_COL below.
+# Join path: company_id → stripe_subscription.biller_customer_id
+#                       → charge.customer → charge.payment_method
+#
+# Each unique payment_method ID represents a different card or bank account.
+# More than _PM_THRESHOLD distinct values triggers an ALERT.
 # ---------------------------------------------------------------------------
-
-_PM_COL     = "default_payment_method"   # ← VERIFY (may be payment_method)
-_PM_THRESHOLD = 2                        # alert when distinct methods > this
-
 
 def check_payment_method_changes(company_id: int) -> Dict[str, Any]:
     """
     ALERT if the company has used more than 2 distinct Stripe payment methods
-    across their subscription history — may indicate card testing or fraud.
+    across all of their charges — may indicate card testing or fraud.
+
+    Shows one row per distinct payment method with usage count and date range.
     """
     sql = f"""
+    WITH company_customers AS (
+        SELECT DISTINCT {_SUB_CUSTOMER_COL} AS stripe_customer
+        FROM {_SUB_TABLE}
+        WHERE {_SUB_COMPANY_COL} = {company_id}
+          AND {_SUB_CUSTOMER_COL} IS NOT NULL
+    )
     SELECT
-        s.id                                    AS subscription_id,
-        s.{_PM_COL}                             AS payment_method_id,
-        s.status                                AS subscription_status,
-        CAST(s.current_period_start AS TIMESTAMP) AS period_start,
-        CAST(s.current_period_end   AS TIMESTAMP) AS period_end,
-        CAST(s.created              AS TIMESTAMP) AS created_at
-    FROM {_SUB_TABLE} s
-    WHERE s.{_SUB_COMPANY_COL} = {company_id}
-      AND s.{_PM_COL}          IS NOT NULL
-    ORDER BY s.created DESC
+        c.{_CHARGE_PM_COL}                      AS payment_method_id,
+        COUNT(*)                                 AS times_charged,
+        ROUND(SUM(c.amount) / 100.0, 2)          AS total_charged_usd,
+        MIN(CAST(c.created AS TIMESTAMP))        AS first_used_at,
+        MAX(CAST(c.created AS TIMESTAMP))        AS last_used_at
+    FROM {_CHG_TABLE} c
+    INNER JOIN company_customers cc
+      ON cc.stripe_customer = c.{_CHARGE_CUSTOMER_COL}
+    WHERE c.{_CHARGE_PM_COL} IS NOT NULL
+    GROUP BY c.{_CHARGE_PM_COL}
+    ORDER BY first_used_at DESC
     """
     try:
         df = run_query(sql)
 
         if df.empty:
-            return _result("CLEAR", "No subscription payment method history found", df, 0)
+            return _result("CLEAR", "No charge payment method history found", df, 0)
 
-        distinct_pms = (
-            df["payment_method_id"].nunique()
-            if "payment_method_id" in df.columns else 0
-        )
-        flagged = distinct_pms > _PM_THRESHOLD
+        distinct_pms = len(df)
+        flagged      = distinct_pms > _PM_THRESHOLD
 
         msg = (
             f"{distinct_pms} distinct payment methods on record — "
@@ -762,7 +773,8 @@ def check_fingerprint_reuse(company_id: int) -> Dict[str, Any]:
     Fingerprints are stable across card re-issues (new expiry / CVV), so a
     match here is highly reliable.
 
-    Join path: company → stripe_subscription.customer → charge → fingerprint
+    Join path: company_id → stripe_subscription.biller_customer_id
+                          → charge.customer → charge.[_FINGERPRINT_COL]
     """
     sql = f"""
     WITH target_customers AS (
@@ -774,16 +786,17 @@ def check_fingerprint_reuse(company_id: int) -> Dict[str, Any]:
     ),
     target_fingerprints AS (
         -- Every distinct card fingerprint ever charged to this company
-        SELECT DISTINCT
-            c.{_FINGERPRINT_COL}            AS fingerprint,
+        SELECT
+            c.{_FINGERPRINT_COL}              AS fingerprint,
             MIN(CAST(c.created AS TIMESTAMP)) AS first_used_on_this_account
         FROM {_CHG_TABLE} c
-        INNER JOIN target_customers tc ON tc.stripe_customer = c.{_SUB_CUSTOMER_COL}
+        INNER JOIN target_customers tc
+          ON tc.stripe_customer = c.{_CHARGE_CUSTOMER_COL}
         WHERE c.{_FINGERPRINT_COL} IS NOT NULL
         GROUP BY c.{_FINGERPRINT_COL}
     ),
     other_company_customers AS (
-        -- Stripe customer IDs for all OTHER companies (for cross-join)
+        -- Stripe customer IDs for all OTHER companies
         SELECT DISTINCT
             s.{_SUB_CUSTOMER_COL} AS stripe_customer,
             s.{_SUB_COMPANY_COL}  AS other_company_id
@@ -801,7 +814,7 @@ def check_fingerprint_reuse(company_id: int) -> Dict[str, Any]:
             MIN(CAST(c.created AS TIMESTAMP)) AS first_seen_at_other_account
         FROM {_CHG_TABLE} c
         INNER JOIN other_company_customers occ
-          ON occ.stripe_customer = c.{_SUB_CUSTOMER_COL}
+          ON occ.stripe_customer = c.{_CHARGE_CUSTOMER_COL}
         INNER JOIN public.companies co
           ON co.company_id = occ.other_company_id
         INNER JOIN target_fingerprints tf
