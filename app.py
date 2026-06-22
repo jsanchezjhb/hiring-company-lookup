@@ -150,8 +150,8 @@ def signal_card(
         "ERROR":   "pill-error",
     }.get(status, "pill-pending")
 
-    expander_title = f"{icon}  **{title}**  —  {badge} {status}"
-    auto_expand    = expand_on_alert and status == "ALERT"
+    expander_title = f"{icon}  **{title}**  —  {badge} {status}  —  {message}"
+    auto_expand    = False  # all cards collapsed by default; user clicks to expand
 
     with st.expander(expander_title, expanded=auto_expand):
 
