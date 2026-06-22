@@ -1,57 +1,59 @@
 """
 db_utils.py — Database connection for the Fraud Detection App.
 
-Auth note: Databricks Apps injects DATABRICKS_TOKEN="" (empty string) into
-the environment even when OAuth M2M credentials are present. The SDK treats
-any DATABRICKS_TOKEN entry — even empty — as a PAT auth method, which
-conflicts with DATABRICKS_CLIENT_ID/SECRET (OAuth). We remove it at import
-time if empty so the SDK only sees one auth method.
+The Databricks Apps platform injects DATABRICKS_TOKEN (set to the user's
+token when User Authorization is on) alongside DATABRICKS_CLIENT_ID and
+DATABRICKS_CLIENT_SECRET. The SDK sees two auth methods and refuses to start.
+
+Fix: save any PAT value before it's removed, always clear DATABRICKS_TOKEN
+from the environment, then manage auth explicitly in _sdk_client().
 """
 
 import os
 import streamlit as st
 import pandas as pd
 
-# Remove empty DATABRICKS_TOKEN before the SDK initialises.
-# Databricks Apps sets this to "" by default; the SDK then sees both PAT
-# (empty token) and OAuth (client_id + client_secret) and refuses to start.
-# Only remove it when empty — a real PAT for local dev is left untouched.
-if not os.environ.get("DATABRICKS_TOKEN", ""):
-    os.environ.pop("DATABRICKS_TOKEN", None)
+# Save PAT value before cleanup — non-empty only in local dev
+_saved_pat = os.environ.get("DATABRICKS_TOKEN", "").strip()
+
+# Always clear DATABRICKS_TOKEN so the SDK never sees it alongside
+# the OAuth credentials. Auth is handled explicitly below.
+os.environ.pop("DATABRICKS_TOKEN", None)
 
 
 # ---------------------------------------------------------------------------
-# Client — per user, not cached globally
+# Client
 # ---------------------------------------------------------------------------
 
 def _sdk_client():
     """
-    Return a WorkspaceClient authenticated as the current user.
+    Build a WorkspaceClient using explicit credentials — no auto-discovery.
 
-    When Databricks Apps User Authorization is enabled, the logged-in user's
-    token arrives in the X-Forwarded-Access-Token header. We use that token
-    so Unity Catalog queries run as the user, not the service principal.
-
-    If no user token is found (local dev, or User Authorization not enabled),
-    WorkspaceClient() is called with NO arguments so the SDK auto-discovers
-    auth from DATABRICKS_CLIENT_ID / DATABRICKS_CLIENT_SECRET env vars.
-    Passing an empty token= alongside OAuth env vars causes a conflict, so
-    we only pass token when it is genuinely non-empty.
+    Priority:
+      1. X-Forwarded-Access-Token header  →  user's token (User Authorization)
+      2. Saved PAT                        →  local dev
+      3. No token                         →  OAuth M2M via env vars (production)
     """
     from databricks.sdk import WorkspaceClient
 
+    host = os.environ.get("DATABRICKS_HOST", "").strip()
+
+    # 1. User Authorization header (Databricks Apps)
     user_token = ""
     try:
         user_token = st.context.headers.get("X-Forwarded-Access-Token", "")
     except AttributeError:
-        # st.context.headers requires Streamlit >= 1.37
         pass
 
     if user_token:
-        host = os.environ.get("DATABRICKS_HOST", "").strip()
         return WorkspaceClient(host=host, token=user_token)
 
-    # No user token — let SDK pick up OAuth or PAT from env vars automatically
+    # 2. PAT for local dev
+    if _saved_pat:
+        return WorkspaceClient(host=host, token=_saved_pat)
+
+    # 3. OAuth M2M — DATABRICKS_CLIENT_ID + SECRET are still in env,
+    #    DATABRICKS_TOKEN is gone, so no conflict
     return WorkspaceClient()
 
 
@@ -62,16 +64,10 @@ def _sdk_client():
 def _warehouse_id() -> str:
     path = os.environ.get("SQL_WAREHOUSE_HTTP_PATH", "").rstrip("/")
     wid  = path.split("/")[-1]
-
     if not wid or wid == "YOUR_WAREHOUSE_ID_HERE":
         raise RuntimeError(
-            "SQL_WAREHOUSE_HTTP_PATH is not configured.\n\n"
-            "Steps to fix:\n"
-            "  1. Go to Databricks → SQL Warehouses\n"
-            "  2. Click your warehouse → Connection Details tab\n"
-            "  3. Copy the HTTP Path  (e.g. /sql/1.0/warehouses/abc1234def5678)\n"
-            "  4. Update app.yaml → env → SQL_WAREHOUSE_HTTP_PATH\n"
-            "  5. Redeploy the app"
+            "SQL_WAREHOUSE_HTTP_PATH is not configured.\n"
+            "Set it to the HTTP Path from your SQL Warehouse Connection Details."
         )
     return wid
 
@@ -81,10 +77,6 @@ def _warehouse_id() -> str:
 # ---------------------------------------------------------------------------
 
 def run_query(sql_text: str) -> pd.DataFrame:
-    """
-    Execute a SQL statement and return results as a DataFrame.
-    Authenticates as the logged-in user when running inside Databricks Apps.
-    """
     from databricks.sdk.service.sql import StatementState
 
     w   = _sdk_client()
