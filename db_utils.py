@@ -21,6 +21,7 @@ def get_conn():
         server_hostname=cfg.host,
         http_path=DATABRICKS_HTTP_PATH,
         credentials_provider=lambda: cfg.authenticate,
+        catalog="prod_redshift_replica",
     )
 
 
