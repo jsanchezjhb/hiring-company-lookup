@@ -65,7 +65,9 @@ def run_query(sql_text: str) -> pd.DataFrame:
             cursor.execute(sql_text)
             rows = cursor.fetchall()
             cols = [d[0] for d in cursor.description] if cursor.description else []
-            return pd.DataFrame(rows, columns=cols)
+            df = pd.DataFrame(rows, columns=cols)
+            # Deduplicate at the source so every signal counts and displays clean data.
+            return df.drop_duplicates().reset_index(drop=True)
     finally:
         conn.close()
 
@@ -78,8 +80,6 @@ EXCLUDE_TEST_COMPANY = "AND c.company_id != 1987234"
 
 
 def _result(status: str, message: str, df: pd.DataFrame, count: int | None = None) -> Dict[str, Any]:
-    if not df.empty:
-        df = df.drop_duplicates().reset_index(drop=True)
     return {
         "status": status,
         "message": message,
