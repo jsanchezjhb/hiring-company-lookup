@@ -321,7 +321,7 @@ def check_hourly_burst(company_id: int) -> Dict[str, Any]:
 #   Both sources are combined via UNION ALL in the signup_geo CTE so every
 #   signup — regardless of when it happened — is evaluated.
 #
-#   _LOCATION_TABLE  : prod_raw.homebase1.locations
+#   _LOCATION_TABLE  : prod_redshift_replica.postgres.locations
 #                      columns: id, company_id, city, state, zip, address_1
 #
 # HOW location_match_status IS SCORED
@@ -342,7 +342,7 @@ def check_hourly_burst(company_id: int) -> Dict[str, Any]:
 
 _IP_SIGNUP_TABLE = "prod_redshift_replica.heap.sign_up_owner_signed_up"          # pre-2023 signups
 _AMPLITUDE_TABLE = "prod_redshift_replica.dbt_staging.s_amp_owner_signups_raw"   # post-2023 signups (workaround)
-_LOCATION_TABLE  = "prod_raw.homebase1.locations"
+_LOCATION_TABLE  = "prod_redshift_replica.postgres.locations"
 
 
 def check_ip_location_mismatch(company_id: int) -> Dict[str, Any]:
@@ -350,8 +350,7 @@ def check_ip_location_mismatch(company_id: int) -> Dict[str, Any]:
     ALERT if the IP address at account creation does not align with the
     company's registered city or state.
 
-    Uses the exact working query provided — prod_raw.homebase1.locations
-    with id, city, state, zip, address_1 columns.
+    Uses prod_redshift_replica.postgres.locations for the registered address.
     Returns ALL rows so the rep sees City Match, State Match Only, and No Match.
     ALERTs when at least one row is 'No Match'.
     """
