@@ -307,21 +307,21 @@ def check_hourly_burst(company_id: int) -> Dict[str, Any]:
 # Signal 4 — IP / Location Mismatch
 # ---------------------------------------------------------------------------
 #
-# TABLE NAME NOTES
-# ─────────────────
-# These two paths are from the original Redshift query.
-# If the Databricks schema names differ, update the constants below —
-# everything else will pick up the change automatically.
+# SIGNUP DATA SOURCES
+# ────────────────────
+#   _IP_SIGNUP_TABLE : Heap events (pre-2023)
+#                      prod_redshift_replica.heap.sign_up_owner_signed_up
+#                      columns: ip, city, region, country, time
 #
-#   _IP_SIGNUP_TABLE   : Heap signup events with IP, city, region, country
-#                        Original: prod_redshift_replica.heap.sign_up_owner_signed_up
-#                        Databricks equivalent may be: heap.sign_up_owner_signed_up
-#                        or ext_heap.sign_up_owner_signed_up
+#   _AMPLITUDE_TABLE : Amplitude events (post-2023)
+#                      prod_enriched.amplitude.owner_signups_enhanced
+#                      columns: ip_address, city, region, country, event_time
 #
-#   _LOCATION_TABLE    : Locations with provided city / state / zip
-#                        Original: prod_raw.homebase1.locations
-#                        Databricks equivalent may be: public.locations
-#                        (verify that city, state, zip columns exist)
+#   Both sources are combined via UNION ALL in the signup_geo CTE so every
+#   signup — regardless of when it happened — is evaluated.
+#
+#   _LOCATION_TABLE  : prod_raw.homebase1.locations
+#                      columns: id, company_id, city, state, zip, address_1
 #
 # HOW location_match_status IS SCORED
 # ─────────────────────────────────────
@@ -329,7 +329,7 @@ def check_hourly_burst(company_id: int) -> Dict[str, Any]:
 #   'State Match Only' →  ip_state == provided_state only   (surfaced, not ALERTed)
 #   'No Match'         →  neither city nor state matches    (ALERT)
 #
-# mismatch_pct heuristic (from the original query):
+# mismatch_pct heuristic:
 #   0%   exact city match
 #   10%  partial city name overlap
 #   25%  known CDN/cloud hub city with state mismatch (Ashburn, Atlanta, etc.)
@@ -339,8 +339,9 @@ def check_hourly_burst(company_id: int) -> Dict[str, Any]:
 #   90%  foreign country
 # ---------------------------------------------------------------------------
 
-_IP_SIGNUP_TABLE = "prod_redshift_replica.heap.sign_up_owner_signed_up"
-_LOCATION_TABLE  = "prod_redshift_replica.postgres.locations"
+_IP_SIGNUP_TABLE = "prod_redshift_replica.heap.sign_up_owner_signed_up"   # pre-2023 signups
+_AMPLITUDE_TABLE = "prod_enriched.amplitude.owner_signups_enhanced"         # post-2023 signups
+_LOCATION_TABLE  = "prod_raw.homebase1.locations"
 
 
 def check_ip_location_mismatch(company_id: int) -> Dict[str, Any]:
@@ -377,6 +378,7 @@ def check_ip_location_mismatch(company_id: int) -> Dict[str, Any]:
         ) AS t(abbr, full_name)
     ),
     signup_geo AS (
+        -- Heap (pre-2023)
         SELECT
             company_id,
             location_id,
@@ -387,6 +389,21 @@ def check_ip_location_mismatch(company_id: int) -> Dict[str, Any]:
             time    AS signup_time
         FROM {_IP_SIGNUP_TABLE}
         WHERE ip IS NOT NULL
+          AND company_id = {company_id}
+
+        UNION ALL
+
+        -- Amplitude (post-2023)
+        SELECT
+            company_id,
+            location_id,
+            ip_address  AS ip,
+            city        AS ip_city,
+            region      AS ip_region,
+            country     AS ip_country,
+            event_time  AS signup_time
+        FROM {_AMPLITUDE_TABLE}
+        WHERE ip_address IS NOT NULL
           AND company_id = {company_id}
     ),
     location_address AS (
@@ -831,7 +848,7 @@ def check_owner_verification(company_id: int) -> Dict[str, Any]:
     JOIN {_JOBS_TABLE}      j ON a.id          = j.user_id
     JOIN {_LOCS_TABLE}      l ON j.location_id = l.id
     WHERE l.company_id = {company_id}
-      AND j.level = 'manager'
+      AND LOWER(j.level) = 'manager'
       AND (a.confirmed_at IS NULL OR a.needs_phone_confirmation = true)
     ORDER BY account_id
     """
@@ -877,7 +894,7 @@ def check_employee_verification(company_id: int) -> Dict[str, Any]:
     JOIN {_JOBS_TABLE}      j ON a.id          = j.user_id
     JOIN {_LOCS_TABLE}      l ON j.location_id = l.id
     WHERE l.company_id = {company_id}
-      AND j.level NOT IN ('owner', 'employer')
+      AND LOWER(j.level) NOT IN ('owner', 'employer')
       AND (a.email IS NOT NULL OR a.phone IS NOT NULL)
     ORDER BY user_role, a.email
     """
@@ -994,7 +1011,9 @@ def check_employee_documents(company_id: int) -> Dict[str, Any]:
 
 def check_payment_method_on_file(company_id: int) -> Dict[str, Any]:
     """
-    ALERT if no Stripe customer can be found for this company.
+    ALERT if no Stripe customer is found, or if the customer has no payment method stored.
+    Payment method presence is determined by stripe.customer.default_source being non-null
+    (covers both legacy card sources and newer PaymentMethod objects).
     Uses three lookup strategies in a UNION so any one hit is sufficient:
       1. customer_subscription.metadata company_id match
       2. charge.metadata company_id match
@@ -1007,7 +1026,7 @@ def check_payment_method_on_file(company_id: int) -> Dict[str, Any]:
         JOIN {_JOBS_TABLE}     j ON a.id          = j.user_id
         JOIN {_LOCS_TABLE}     l ON j.location_id = l.id
         WHERE l.company_id = {company_id}
-          AND j.level = 'manager'
+          AND LOWER(j.level) = 'manager'
           AND a.email IS NOT NULL
     ),
     company_customers AS (
@@ -1028,14 +1047,16 @@ def check_payment_method_on_file(company_id: int) -> Dict[str, Any]:
     )
     SELECT
         cc.stripe_customer,
-        COUNT(c.id)                                                    AS total_charges,
-        SUM(CASE WHEN c.status = 'succeeded' THEN 1 ELSE 0 END)       AS successful_charges,
-        SUM(CASE WHEN c.status = 'failed'    THEN 1 ELSE 0 END)       AS failed_charges,
-        MIN(FROM_UNIXTIME(c.created))                                  AS first_charge_at,
-        MAX(FROM_UNIXTIME(c.created))                                  AS last_charge_at
+        sc.default_source                                                      AS payment_method_on_file,
+        COUNT(c.id)                                                            AS total_charges,
+        SUM(CASE WHEN c.status = 'succeeded' THEN 1 ELSE 0 END)               AS successful_charges,
+        SUM(CASE WHEN c.status = 'failed'    THEN 1 ELSE 0 END)               AS failed_charges,
+        MIN(FROM_UNIXTIME(c.created))                                          AS first_charge_at,
+        MAX(FROM_UNIXTIME(c.created))                                          AS last_charge_at
     FROM company_customers cc
-    LEFT JOIN {_CHG_TABLE} c ON c.customer = cc.stripe_customer
-    GROUP BY cc.stripe_customer
+    LEFT JOIN {_CUST_TABLE}  sc ON sc.id       = cc.stripe_customer
+    LEFT JOIN {_CHG_TABLE}   c  ON c.customer  = cc.stripe_customer
+    GROUP BY cc.stripe_customer, sc.default_source
     """
     try:
         df = run_query(sql)
@@ -1046,16 +1067,22 @@ def check_payment_method_on_file(company_id: int) -> Dict[str, Any]:
                 pd.DataFrame(),
                 0,
             )
+        has_pm = (
+            "payment_method_on_file" in df.columns
+            and df["payment_method_on_file"].notna().any()
+            and (df["payment_method_on_file"] != "").any()
+        )
         total      = int(df["total_charges"].sum())      if "total_charges"      in df.columns else 0
         successful = int(df["successful_charges"].sum()) if "successful_charges" in df.columns else 0
-        if total == 0:
-            return _result(
-                "CLEAR",
-                f"Stripe customer on file ({df['stripe_customer'].iloc[0]}) — no charges yet",
-                df,
-                0,
+        customer   = df["stripe_customer"].iloc[0]
+        if has_pm:
+            msg = (
+                f"Payment method on file ({customer})"
+                + (f" — {total} charge{'s' if total != 1 else ''} ({successful} successful)" if total > 0 else "")
             )
-        msg = f"Payment method on file — {total} charge{'s' if total != 1 else ''} ({successful} successful)"
-        return _result("CLEAR", msg, df, total)
+            return _result("CLEAR", msg, df, total)
+        else:
+            msg = f"Stripe customer found ({customer}) but no payment method on file"
+            return _result("ALERT", msg, df, 0)
     except Exception as exc:
         return _error(exc)
