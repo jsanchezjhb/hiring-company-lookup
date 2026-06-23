@@ -365,54 +365,6 @@ def main():
     )
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Signal cards — Job Posting Behaviour
-    # ─────────────────────────────────────────────────────────────────────────
-    st.markdown(
-        "<div class='section-label'>📌 Job Posting Behaviour</div>",
-        unsafe_allow_html=True,
-    )
-
-    signal_card(
-        icon="📋",
-        title="Active Job Posts",
-        description=(
-            "Flags companies with 10 or more currently active job postings. "
-            "Legitimate businesses rarely maintain this many simultaneous open roles."
-        ),
-        result=results["active_jobs"],
-    )
-
-    signal_card(
-        icon="⚡",
-        title="Rapid Posting — Under 1 Minute Apart",
-        description=(
-            "Flags any two consecutive job posts created less than 60 seconds apart. "
-            "This pattern is consistent with automated or bulk fraudulent submission."
-        ),
-        result=results["rapid_postings"],
-    )
-
-    signal_card(
-        icon="📈",
-        title="Hourly Posting Burst — 4+ Jobs in One Hour",
-        description=(
-            "Flags when 4 or more jobs were posted within the same clock hour. "
-            "Expands to show every job in the flagged window."
-        ),
-        result=results["hourly_burst"],
-    )
-
-    signal_card(
-        icon="💤",
-        title="Dormancy Reactivation — 30+ Day Gap",
-        description=(
-            "Flags when a company resumes posting after 30+ days of no activity. "
-            "May indicate account takeover, a reactivated fraud ring, or bot behaviour."
-        ),
-        result=results["dormancy"],
-    )
-
-    # ─────────────────────────────────────────────────────────────────────────
     # Signal cards — Account & Identity
     # ─────────────────────────────────────────────────────────────────────────
     st.markdown(
@@ -557,6 +509,54 @@ def main():
             "Stripe fingerprints are stable even when a card is re-issued with a new expiry date."
         ),
         result=results["fingerprint_reuse"],
+    )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Signal cards — Job Posting Behaviour
+    # ─────────────────────────────────────────────────────────────────────────
+    st.markdown(
+        "<div class='section-label'>📌 Job Posting Behaviour</div>",
+        unsafe_allow_html=True,
+    )
+
+    signal_card(
+        icon="📋",
+        title="Active Job Posts",
+        description=(
+            "Flags companies with 10 or more currently active job postings. "
+            "Legitimate businesses rarely maintain this many simultaneous open roles."
+        ),
+        result=results["active_jobs"],
+    )
+
+    signal_card(
+        icon="⚡",
+        title="Rapid Posting — Under 1 Minute Apart",
+        description=(
+            "Flags any two consecutive job posts created less than 60 seconds apart. "
+            "This pattern is consistent with automated or bulk fraudulent submission."
+        ),
+        result=results["rapid_postings"],
+    )
+
+    signal_card(
+        icon="📈",
+        title="Hourly Posting Burst — 4+ Jobs in One Hour",
+        description=(
+            "Flags when 4 or more jobs were posted within the same clock hour. "
+            "Expands to show every job in the flagged window."
+        ),
+        result=results["hourly_burst"],
+    )
+
+    signal_card(
+        icon="💤",
+        title="Dormancy Reactivation — 30+ Day Gap",
+        description=(
+            "Flags when a company resumes posting after 30+ days of no activity. "
+            "May indicate account takeover, a reactivated fraud ring, or bot behaviour."
+        ),
+        result=results["dormancy"],
     )
 
     # ── Footer ───────────────────────────────────────────────────────────────
