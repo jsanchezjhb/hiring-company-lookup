@@ -778,7 +778,7 @@ def check_suspicious_email_domains(company_id: int) -> Dict[str, Any]:
     JOIN {_LOCS_TABLE}      l ON j.location_id = l.id
     WHERE l.company_id = {company_id}
       AND LOWER(SPLIT(a.email, '@')[1]) IN ({_FRAUD_DOMAINS_SQL})
-    ORDER BY j.level, a.email
+    ORDER BY user_role, a.email
     """
     try:
         df = run_query(sql)
@@ -859,7 +859,7 @@ def check_employee_verification(company_id: int) -> Dict[str, Any]:
     WHERE l.company_id = {company_id}
       AND j.level != 'owner'
       AND (a.confirmed_at IS NULL OR a.needs_phone_confirmation = true)
-    ORDER BY j.level, a.email
+    ORDER BY user_role, a.email
     """
     try:
         df = run_query(sql)
@@ -876,17 +876,19 @@ def check_employee_verification(company_id: int) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Signal 13 — Suspicious Timecard Patterns
+# Signal 13 — Suspicious Manager Timecard Overrides
 # ---------------------------------------------------------------------------
 
 def check_suspicious_timecards(company_id: int) -> Dict[str, Any]:
     """
-    ALERT if any timecards were NOT entered by a manager (clock_in_source != 'manager').
-    Also flags rows matching an exact 9:00–17:00 Mon–Fri template pattern, which
-    is consistent with fabricated / bulk-generated punch records.
+    ALERT if a manager entered more than 3 timecard punches (clock_in_source = 'manager')
+    within the most recent pay period (last 14 days as proxy).
 
-    DAYOFWEEK() convention in Databricks SQL: 1=Sun, 2=Mon, ..., 7=Sat
+    Employees are expected to clock themselves in/out. A manager entering punches
+    is an override — rare and legitimate in isolation, but more than 3 in a single
+    pay period is suspicious and may indicate fabricated records.
     """
+    THRESHOLD = 3
     sql = f"""
     SELECT
         tc.id                       AS timecard_id,
@@ -899,39 +901,31 @@ def check_suspicious_timecards(company_id: int) -> Dict[str, Any]:
         tc.approved,
         DAYOFWEEK(tc.start_at)      AS day_of_week,
         HOUR(tc.start_at)           AS start_hour,
-        MINUTE(tc.start_at)         AS start_minute,
-        HOUR(tc.end_at)             AS end_hour,
-        MINUTE(tc.end_at)           AS end_minute,
-        CASE WHEN
-            HOUR(tc.start_at)  = 9  AND MINUTE(tc.start_at) <= 5
-            AND HOUR(tc.end_at) = 17 AND MINUTE(tc.end_at)  <= 5
-            AND DAYOFWEEK(tc.start_at) BETWEEN 2 AND 6
-        THEN true ELSE false END    AS exact_9to5_weekday
+        HOUR(tc.end_at)             AS end_hour
     FROM {_TIMECARDS_TABLE} tc
     JOIN {_JOBS_TABLE}       j  ON tc.job_id      = j.id
     JOIN {_LOCS_TABLE}       l  ON j.location_id  = l.id
     WHERE l.company_id = {company_id}
-      AND tc.clock_in_source IS NOT NULL
-      AND tc.clock_in_source != 'manager'
+      AND tc.clock_in_source = 'manager'
+      AND tc.start_at >= DATE_SUB(CURRENT_DATE(), 14)
       AND tc.start_at IS NOT NULL
       AND tc.end_at   IS NOT NULL
     ORDER BY tc.start_at DESC
-    LIMIT 500
     """
     try:
         df = run_query(sql)
         count = len(df)
-        flagged = count > 0
+        flagged = count > THRESHOLD
         if flagged:
-            suspicious = int(df["exact_9to5_weekday"].sum()) if "exact_9to5_weekday" in df.columns else 0
-            pct = round(100 * suspicious / count, 1) if count > 0 else 0.0
             msg = (
-                f"{count} non-manager timecard{'s' if count != 1 else ''} found; "
-                f"{suspicious} ({pct}%) match exact 9–5 Mon–Fri template pattern"
+                f"{count} manager-entered punch{'es' if count != 1 else ''} in the last 14 days "
+                f"— exceeds threshold of {THRESHOLD}"
             )
+        elif count > 0:
+            msg = f"{count} manager-entered punch{'es' if count != 1 else ''} in the last 14 days — within normal range"
         else:
-            msg = "All timecards entered by manager — no self-punch entries detected"
-        return _result("ALERT" if flagged else "CLEAR", msg, df, count)
+            msg = "No manager-entered punches in the last 14 days"
+        return _result("ALERT" if flagged else "CLEAR", msg, df if flagged else pd.DataFrame(), count)
     except Exception as exc:
         return _error(exc)
 
