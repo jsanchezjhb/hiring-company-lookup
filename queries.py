@@ -67,7 +67,18 @@ def run_query(sql_text: str) -> pd.DataFrame:
             cols = [d[0] for d in cursor.description] if cursor.description else []
             df = pd.DataFrame(rows, columns=cols)
             # Deduplicate at the source so every signal counts and displays clean data.
-            return df.drop_duplicates().reset_index(drop=True)
+            df = df.drop_duplicates().reset_index(drop=True)
+            # Convert ID columns to plain strings so Streamlit doesn't add comma separators.
+            # Handles integer, float (.0), and already-string IDs (e.g. Stripe cus_ IDs).
+            id_cols = [c for c in df.columns if c == "id" or c.endswith("_id")]
+            for col in id_cols:
+                df[col] = (
+                    df[col]
+                    .astype(str)
+                    .str.replace(r"\.0$", "", regex=True)
+                    .replace("nan", "")
+                )
+            return df
     finally:
         conn.close()
 
@@ -771,7 +782,7 @@ def check_suspicious_email_domains(company_id: int) -> Dict[str, Any]:
     """
     sql = f"""
     SELECT DISTINCT
-        a.id                                   AS account_id,
+        a.id                                   AS user_id,
         a.email,
         LOWER(SPLIT(a.email, '@')[1])          AS email_domain,
         j.level                                AS user_role
@@ -824,7 +835,7 @@ def check_owner_verification(company_id: int) -> Dict[str, Any]:
     JOIN {_LOCS_TABLE}      l ON j.location_id = l.id
     WHERE l.company_id = {company_id}
       AND j.level IN ('owner', 'employer')
-    ORDER BY a.id
+    ORDER BY account_id
     LIMIT 1
     """
     try:
@@ -953,9 +964,8 @@ def check_suspicious_timecards(company_id: int) -> Dict[str, Any]:
 
 def check_employee_documents(company_id: int) -> Dict[str, Any]:
     """
-    ALERT if any onboarding documents are already uploaded for this company.
-    For brand-new companies, pre-uploaded documents warrant verification —
-    they may be forged or uploaded to falsely establish legitimacy.
+    CLEAR (positive) if onboarding documents are on file — indicates a more established company.
+    CLEAR (neutral)  if none found — not inherently bad, but provides no positive signal.
     """
     sql = f"""
     SELECT
@@ -973,13 +983,13 @@ def check_employee_documents(company_id: int) -> Dict[str, Any]:
     try:
         df = run_query(sql)
         count = len(df)
-        flagged = count > 0
+        has_docs = count > 0
         msg = (
-            f"{count} onboarding document{'s' if count != 1 else ''} on file — verify authenticity"
-            if flagged else
-            "No employee onboarding documents found"
+            f"{count} onboarding document{'s' if count != 1 else ''} on file — positive signal"
+            if has_docs else
+            "No onboarding documents found — no positive signal from document verification"
         )
-        return _result("ALERT" if flagged else "CLEAR", msg, df, count)
+        return _result("CLEAR", msg, df, count)
     except Exception as exc:
         return _error(exc)
 
@@ -991,12 +1001,24 @@ def check_employee_documents(company_id: int) -> Dict[str, Any]:
 def check_payment_method_on_file(company_id: int) -> Dict[str, Any]:
     """
     ALERT if no Stripe payment method is on file for this company.
-    A new company attempting to use a paid Hiring feature without
-    a payment method configured is a potential fraud signal.
-    Uses the same customer_subscription linkage as Signals 6–9.
+
+    New companies may have a Stripe customer created when they add a payment method
+    for a trial, before any subscription exists. The shared _company_customers_cte
+    only checks customer_subscription, so we use a broader local CTE here that also
+    checks the charge table's metadata — ensuring we find the customer either way.
     """
     sql = f"""
-    WITH {_company_customers_cte(company_id)}
+    WITH company_customers AS (
+        SELECT DISTINCT customer AS stripe_customer
+        FROM {_SUB_TABLE}
+        WHERE {_META_CO_ID} = '{company_id}'
+          AND customer IS NOT NULL
+        UNION
+        SELECT DISTINCT customer AS stripe_customer
+        FROM {_CHG_TABLE}
+        WHERE {_META_CO_ID} = '{company_id}'
+          AND customer IS NOT NULL
+    )
     SELECT
         cc.stripe_customer,
         COUNT(c.id)                                                    AS total_charges,
@@ -1021,8 +1043,8 @@ def check_payment_method_on_file(company_id: int) -> Dict[str, Any]:
         successful = int(df["successful_charges"].sum()) if "successful_charges" in df.columns else 0
         if total == 0:
             return _result(
-                "ALERT",
-                "Stripe customer linked but no charges on record — payment method may not be active",
+                "CLEAR",
+                f"Stripe customer on file ({df['stripe_customer'].iloc[0]}) — no charges yet",
                 df,
                 0,
             )
