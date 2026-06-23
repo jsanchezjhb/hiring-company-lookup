@@ -20,6 +20,12 @@ from queries import (
     check_billing_disputes,
     check_payment_method_changes,
     check_fingerprint_reuse,
+    check_suspicious_email_domains,
+    check_owner_verification,
+    check_employee_verification,
+    check_suspicious_timecards,
+    check_employee_documents,
+    check_payment_method_on_file,
 )
 
 # ─── Page config (must be first Streamlit call) ───────────────────────────────
@@ -235,14 +241,21 @@ def main():
             unsafe_allow_html=True,
         )
         signals_info = [
-            ("📋", "Active Job Posts",            "10+ active jobs at the same time"),
-            ("⚡", "Rapid Posting",               "Multiple jobs created < 1 minute apart"),
-            ("📈", "Hourly Burst",                "4+ jobs posted within a single hour"),
-            ("🌐", "IP / Location Mismatch",      "Account IP doesn't match company city/state"),
-            ("💤", "Dormancy Reactivation",        "30+ day gap then sudden job posting"),
-            ("💳", "Failed Billing",              "Unsuccessful Stripe billing attempts"),
-            ("⚖️", "Billing Disputes",            "Open or resolved billing disputes"),
-            ("🔄", "Payment Method Changes",      "3+ payment method changes on Stripe"),
+            ("📋", "Active Job Posts",              "10+ active jobs at the same time"),
+            ("⚡", "Rapid Posting",                 "Multiple jobs created < 1 minute apart"),
+            ("📈", "Hourly Burst",                  "4+ jobs posted within a single hour"),
+            ("🌐", "IP / Location Mismatch",        "Account IP doesn't match company city/state"),
+            ("💤", "Dormancy Reactivation",          "30+ day gap then sudden job posting"),
+            ("💳", "Failed Billing",                "Unsuccessful Stripe billing attempts"),
+            ("⚖️", "Billing Disputes",              "Open or resolved billing disputes"),
+            ("🔄", "Payment Method Changes",        "3+ payment method changes on Stripe"),
+            ("🫂", "Stripe Fingerprint Reuse",      "Same card used across multiple company accounts"),
+            ("📧", "Suspicious Email Domains",      "Owner or employees using known fraud-associated domains"),
+            ("👤", "Owner Verification",            "Owner email or phone not verified"),
+            ("👥", "Employee Verification",         "Employee accounts with unverified contact details"),
+            ("🕐", "Suspicious Timecards",          "Non-manager punch entries or exact 9–5 Mon–Fri pattern"),
+            ("📁", "Employee Documents",            "Onboarding documents pre-uploaded on a new account"),
+            ("💰", "Payment Method on File",        "No Stripe payment method linked to this company"),
         ]
         for icon, name, desc in signals_info:
             st.markdown(f"- **{icon} {name}** — {desc}")
@@ -292,15 +305,21 @@ def main():
     st.markdown("### 🛡️ Fraud Signal Analysis")
 
     SIGNAL_FNS = {
-        "active_jobs":         check_active_job_posts,
-        "rapid_postings":      check_rapid_postings,
-        "hourly_burst":        check_hourly_burst,
-        "ip_mismatch":         check_ip_location_mismatch,
-        "dormancy":            check_dormancy_reactivation,
-        "failed_billing":      check_failed_billing,
-        "disputes":            check_billing_disputes,
-        "pm_changes":          check_payment_method_changes,
-        "fingerprint_reuse":   check_fingerprint_reuse,
+        "active_jobs":          check_active_job_posts,
+        "rapid_postings":       check_rapid_postings,
+        "hourly_burst":         check_hourly_burst,
+        "ip_mismatch":          check_ip_location_mismatch,
+        "dormancy":             check_dormancy_reactivation,
+        "failed_billing":       check_failed_billing,
+        "disputes":             check_billing_disputes,
+        "pm_changes":           check_payment_method_changes,
+        "fingerprint_reuse":    check_fingerprint_reuse,
+        "suspicious_domains":   check_suspicious_email_domains,
+        "owner_verification":   check_owner_verification,
+        "employee_verification": check_employee_verification,
+        "suspicious_timecards": check_suspicious_timecards,
+        "employee_documents":   check_employee_documents,
+        "payment_method":       check_payment_method_on_file,
     }
 
     results: dict[str, dict] = {}
@@ -415,11 +434,86 @@ def main():
     )
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Signal cards — Account & Employee Risk
+    # ─────────────────────────────────────────────────────────────────────────
+    st.markdown(
+        "<div class='section-label'>👤 Account & Employee Risk</div>",
+        unsafe_allow_html=True,
+    )
+
+    signal_card(
+        icon="📧",
+        title="Suspicious Email Domains",
+        description=(
+            "Checks whether the owner or any employee account is using an email domain "
+            "historically associated with fraudulent or disposable registrations "
+            "(e.g. mail.com, engineer.com, usa.com). "
+            "Flags all matching accounts with their role and domain."
+        ),
+        result=results["suspicious_domains"],
+    )
+
+    signal_card(
+        icon="👤",
+        title="Owner Email / Phone Verification",
+        description=(
+            "Checks whether the owner account has verified their email address (confirmed_at) "
+            "and phone number (needs_phone_confirmation). "
+            "An unverified owner on a new account is a strong identity risk signal."
+        ),
+        result=results["owner_verification"],
+    )
+
+    signal_card(
+        icon="👥",
+        title="Employee Email / Phone Verification",
+        description=(
+            "Flags any employee or manager account linked to this company that has not verified "
+            "their email or phone. A high proportion of unverified employees on a new account "
+            "may indicate bulk fake account creation."
+        ),
+        result=results["employee_verification"],
+    )
+
+    signal_card(
+        icon="🕐",
+        title="Suspicious Timecard Patterns",
+        description=(
+            "Flags timecard entries that were NOT submitted by a manager (clock_in_source ≠ 'manager'). "
+            "Within those, highlights records matching an exact 9:00–17:00 Mon–Fri template pattern — "
+            "consistent with fabricated or auto-generated punch data used to appear legitimate."
+        ),
+        result=results["suspicious_timecards"],
+    )
+
+    signal_card(
+        icon="📁",
+        title="Employee Onboarding Documents",
+        description=(
+            "Flags when onboarding documents are already uploaded for a new company. "
+            "Pre-uploaded documents on a brand-new account may be forged or "
+            "uploaded to falsely establish legitimacy — worth verifying."
+        ),
+        result=results["employee_documents"],
+    )
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Signal cards — Billing & Payments
     # ─────────────────────────────────────────────────────────────────────────
     st.markdown(
         "<div class='section-label'>💳 Billing & Payments</div>",
         unsafe_allow_html=True,
+    )
+
+    signal_card(
+        icon="💰",
+        title="Payment Method on File",
+        description=(
+            "Checks whether this company has a Stripe customer record with charges on file. "
+            "A new company using a paid Hiring feature with no payment method configured "
+            "is a potential fraud signal — they may not intend to pay."
+        ),
+        result=results["payment_method"],
     )
 
     signal_card(
