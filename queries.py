@@ -78,6 +78,8 @@ EXCLUDE_TEST_COMPANY = "AND c.company_id != 1987234"
 
 
 def _result(status: str, message: str, df: pd.DataFrame, count: int | None = None) -> Dict[str, Any]:
+    if not df.empty:
+        df = df.drop_duplicates().reset_index(drop=True)
     return {
         "status": status,
         "message": message,
