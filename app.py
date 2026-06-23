@@ -251,7 +251,7 @@ def main():
             ("🔄", "Payment Method Changes",        "3+ payment method changes on Stripe"),
             ("🫂", "Stripe Fingerprint Reuse",      "Same card used across multiple company accounts"),
             ("📧", "Suspicious Email Domains",      "Owner or employees using known fraud-associated domains"),
-            ("👤", "Owner Verification",            "Owner email or phone not verified"),
+            ("👤", "Manager Verification",           "Manager email or phone not verified"),
             ("👥", "Employee Verification",         "Employee accounts with unverified contact details"),
             ("🕐", "Suspicious Timecard Overrides", "Manager entered 3+ punches in the last pay period"),
             ("📁", "Employee Documents",            "Onboarding documents pre-uploaded on a new account"),
@@ -407,11 +407,11 @@ def main():
 
     signal_card(
         icon="👤",
-        title="Owner Email / Phone Verification",
+        title="Manager Email / Phone Verification",
         description=(
-            "Checks whether the owner account has verified their email address (confirmed_at) "
-            "and phone number (needs_phone_confirmation). "
-            "An unverified owner on a new account is a strong identity risk signal."
+            "Checks whether all manager accounts on this company have verified their email "
+            "address (confirmed_at) and phone number (needs_phone_confirmation). "
+            "An unverified manager on a new account is a strong identity risk signal."
         ),
         result=results["owner_verification"],
     )
