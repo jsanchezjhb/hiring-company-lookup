@@ -314,7 +314,8 @@ def check_hourly_burst(company_id: int) -> Dict[str, Any]:
 #                      columns: ip, city, region, country, time
 #
 #   _AMPLITUDE_TABLE : Amplitude events (post-2023)
-#                      prod_enriched.amplitude.owner_signups_enhanced
+#                      prod_redshift_replica.dbt_staging.s_amp_owner_signups_raw
+#                      (workaround — prod_enriched.amplitude table is restricted)
 #                      columns: ip_address, city, region, country, event_time
 #
 #   Both sources are combined via UNION ALL in the signup_geo CTE so every
@@ -339,8 +340,8 @@ def check_hourly_burst(company_id: int) -> Dict[str, Any]:
 #   90%  foreign country
 # ---------------------------------------------------------------------------
 
-_IP_SIGNUP_TABLE = "prod_redshift_replica.heap.sign_up_owner_signed_up"   # pre-2023 signups
-_AMPLITUDE_TABLE = "prod_enriched.amplitude.owner_signups_enhanced"         # post-2023 signups
+_IP_SIGNUP_TABLE = "prod_redshift_replica.heap.sign_up_owner_signed_up"          # pre-2023 signups
+_AMPLITUDE_TABLE = "prod_redshift_replica.dbt_staging.s_amp_owner_signups_raw"   # post-2023 signups (workaround)
 _LOCATION_TABLE  = "prod_raw.homebase1.locations"
 
 
