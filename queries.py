@@ -805,36 +805,45 @@ def check_owner_verification(company_id: int) -> Dict[str, Any]:
     ALERT if the owner account has not verified their email or phone number.
     Email verified : confirmed_at IS NOT NULL
     Phone verified : needs_phone_confirmation = false
+
+    NOTE: Homebase stores the account owner as j.level = 'employer' in the jobs table.
+    We query for 'employer' and 'owner' to be safe across schema variations.
+    We fetch the row regardless of verification status so we can always assess it.
     """
     sql = f"""
     SELECT DISTINCT
-        a.id                                                                   AS account_id,
+        a.id                                                                     AS account_id,
         a.email,
         a.phone,
-        CASE WHEN a.confirmed_at IS NOT NULL      THEN 'Verified' ELSE 'NOT VERIFIED' END AS email_verified,
-        CASE WHEN a.needs_phone_confirmation = false THEN 'Verified' ELSE 'NOT VERIFIED' END AS phone_verified,
-        a.confirmed_at                                                         AS email_verified_at
+        j.level                                                                  AS user_role,
+        CASE WHEN a.confirmed_at         IS NOT NULL THEN 'Verified' ELSE 'NOT VERIFIED' END AS email_verified,
+        CASE WHEN a.needs_phone_confirmation = false  THEN 'Verified' ELSE 'NOT VERIFIED' END AS phone_verified,
+        a.confirmed_at                                                           AS email_verified_at
     FROM {_ACCOUNTS_TABLE} a
     JOIN {_JOBS_TABLE}      j ON a.id          = j.user_id
     JOIN {_LOCS_TABLE}      l ON j.location_id = l.id
     WHERE l.company_id = {company_id}
-      AND j.level = 'owner'
-      AND (a.confirmed_at IS NULL OR a.needs_phone_confirmation = true)
+      AND j.level IN ('owner', 'employer')
+    ORDER BY a.id
+    LIMIT 1
     """
     try:
         df = run_query(sql)
-        count = len(df)
-        flagged = count > 0
-        if flagged and not df.empty:
+        if df.empty:
+            return _result("PENDING", "No owner account found for this company", df, 0)
+        email_ok = df["email_verified"].iloc[0] == "Verified"   if "email_verified" in df.columns else True
+        phone_ok = df["phone_verified"].iloc[0] == "Verified"   if "phone_verified" in df.columns else True
+        flagged = not email_ok or not phone_ok
+        if flagged:
             parts = []
-            if "email_verified" in df.columns and (df["email_verified"] == "NOT VERIFIED").any():
+            if not email_ok:
                 parts.append("email unverified")
-            if "phone_verified" in df.columns and (df["phone_verified"] == "NOT VERIFIED").any():
+            if not phone_ok:
                 parts.append("phone unverified")
-            msg = f"Owner account: {' + '.join(parts) if parts else 'verification incomplete'}"
+            msg = f"Owner account: {' + '.join(parts)}"
         else:
             msg = "Owner email and phone are both verified"
-        return _result("ALERT" if flagged else "CLEAR", msg, df, count)
+        return _result("ALERT" if flagged else "CLEAR", msg, df, int(flagged))
     except Exception as exc:
         return _error(exc)
 
@@ -845,34 +854,40 @@ def check_owner_verification(company_id: int) -> Dict[str, Any]:
 
 def check_employee_verification(company_id: int) -> Dict[str, Any]:
     """
-    ALERT if any employee or manager account has an unverified email or phone.
+    ALERT if zero employee/manager accounts have verified their email or phone.
+    Excludes accounts with no email AND no phone (placeholder/shell accounts).
+    Uses 'employer' as the owner level to exclude — mirroring check_owner_verification.
     """
     sql = f"""
     SELECT DISTINCT
-        a.id                                                                   AS account_id,
+        a.id                                                                     AS account_id,
         a.email,
         a.phone,
-        j.level                                                                AS user_role,
-        CASE WHEN a.confirmed_at IS NOT NULL      THEN 'Verified' ELSE 'NOT VERIFIED' END AS email_verified,
-        CASE WHEN a.needs_phone_confirmation = false THEN 'Verified' ELSE 'NOT VERIFIED' END AS phone_verified
+        j.level                                                                  AS user_role,
+        CASE WHEN a.confirmed_at         IS NOT NULL THEN 'Verified' ELSE 'NOT VERIFIED' END AS email_verified,
+        CASE WHEN a.needs_phone_confirmation = false  THEN 'Verified' ELSE 'NOT VERIFIED' END AS phone_verified,
+        CASE WHEN a.confirmed_at IS NOT NULL OR a.needs_phone_confirmation = false
+             THEN true ELSE false END                                             AS any_verified
     FROM {_ACCOUNTS_TABLE} a
     JOIN {_JOBS_TABLE}      j ON a.id          = j.user_id
     JOIN {_LOCS_TABLE}      l ON j.location_id = l.id
     WHERE l.company_id = {company_id}
-      AND j.level != 'owner'
-      AND (a.confirmed_at IS NULL OR a.needs_phone_confirmation = true)
+      AND j.level NOT IN ('owner', 'employer')
+      AND (a.email IS NOT NULL OR a.phone IS NOT NULL)
     ORDER BY user_role, a.email
     """
     try:
         df = run_query(sql)
-        count = len(df)
-        flagged = count > 0
-        msg = (
-            f"{count} employee account{'s' if count != 1 else ''} with unverified email or phone"
-            if flagged else
-            "All employee accounts have verified contact details"
-        )
-        return _result("ALERT" if flagged else "CLEAR", msg, df, count)
+        if df.empty:
+            return _result("PENDING", "No employee accounts with contact details found", df, 0)
+        total    = len(df)
+        verified = int(df["any_verified"].sum()) if "any_verified" in df.columns else 0
+        flagged  = verified == 0
+        if flagged:
+            msg = f"No employees have verified their email or phone ({total} account{'s' if total != 1 else ''} checked)"
+        else:
+            msg = f"{verified} of {total} employee account{'s' if total != 1 else ''} have verified contact details"
+        return _result("ALERT" if flagged else "CLEAR", msg, df, verified)
     except Exception as exc:
         return _error(exc)
 
