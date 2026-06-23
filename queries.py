@@ -556,6 +556,7 @@ def check_dormancy_reactivation(company_id: int) -> Dict[str, Any]:
 
 _SUB_TABLE  = "prod_redshift_replica.stripe.customer_subscription"  # company → customer
 _CHG_TABLE  = "prod_redshift_replica.stripe.charge"                 # Signals 6, 7, 8, 9
+_CUST_TABLE = "prod_redshift_replica.stripe.customer"               # Signal 15 email lookup
 _CO_TABLE   = "prod_redshift_replica.public.companies"              # Signal 9 name lookup
 
 # customer_subscription.metadata contains company_id as a JSON string:
@@ -808,18 +809,14 @@ def check_suspicious_email_domains(company_id: int) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Signal 11 — Owner Email / Phone Verification
+# Signal 11 — Manager Email / Phone Verification
 # ---------------------------------------------------------------------------
 
 def check_owner_verification(company_id: int) -> Dict[str, Any]:
     """
-    ALERT if the owner account has not verified their email or phone number.
-    Email verified : confirmed_at IS NOT NULL
-    Phone verified : needs_phone_confirmation = false
-
-    NOTE: Homebase stores the account owner as j.level = 'employer' in the jobs table.
-    We query for 'employer' and 'owner' to be safe across schema variations.
-    We fetch the row regardless of verification status so we can always assess it.
+    ALERT if any manager account on this company has not verified their email or phone.
+    We check managers (j.level = 'manager') since the account owner is stored
+    at that level in Homebase's jobs table.
     """
     sql = f"""
     SELECT DISTINCT
@@ -834,27 +831,24 @@ def check_owner_verification(company_id: int) -> Dict[str, Any]:
     JOIN {_JOBS_TABLE}      j ON a.id          = j.user_id
     JOIN {_LOCS_TABLE}      l ON j.location_id = l.id
     WHERE l.company_id = {company_id}
-      AND j.level IN ('owner', 'employer')
+      AND j.level = 'manager'
+      AND (a.confirmed_at IS NULL OR a.needs_phone_confirmation = true)
     ORDER BY account_id
-    LIMIT 1
     """
     try:
         df = run_query(sql)
-        if df.empty:
-            return _result("PENDING", "No owner account found for this company", df, 0)
-        email_ok = df["email_verified"].iloc[0] == "Verified"   if "email_verified" in df.columns else True
-        phone_ok = df["phone_verified"].iloc[0] == "Verified"   if "phone_verified" in df.columns else True
-        flagged = not email_ok or not phone_ok
+        count = len(df)
+        flagged = count > 0
         if flagged:
             parts = []
-            if not email_ok:
+            if "email_verified" in df.columns and (df["email_verified"] == "NOT VERIFIED").any():
                 parts.append("email unverified")
-            if not phone_ok:
+            if "phone_verified" in df.columns and (df["phone_verified"] == "NOT VERIFIED").any():
                 parts.append("phone unverified")
-            msg = f"Owner account: {' + '.join(parts)}"
+            msg = f"{count} manager account{'s' if count != 1 else ''}: {' + '.join(parts) if parts else 'verification incomplete'}"
         else:
-            msg = "Owner email and phone are both verified"
-        return _result("ALERT" if flagged else "CLEAR", msg, df, int(flagged))
+            msg = "All manager accounts have verified email and phone"
+        return _result("ALERT" if flagged else "CLEAR", msg, df, count)
     except Exception as exc:
         return _error(exc)
 
@@ -1000,15 +994,23 @@ def check_employee_documents(company_id: int) -> Dict[str, Any]:
 
 def check_payment_method_on_file(company_id: int) -> Dict[str, Any]:
     """
-    ALERT if no Stripe payment method is on file for this company.
-
-    New companies may have a Stripe customer created when they add a payment method
-    for a trial, before any subscription exists. The shared _company_customers_cte
-    only checks customer_subscription, so we use a broader local CTE here that also
-    checks the charge table's metadata — ensuring we find the customer either way.
+    ALERT if no Stripe customer can be found for this company.
+    Uses three lookup strategies in a UNION so any one hit is sufficient:
+      1. customer_subscription.metadata company_id match
+      2. charge.metadata company_id match
+      3. stripe.customer.email matches the company's manager account email
     """
     sql = f"""
-    WITH company_customers AS (
+    WITH manager_emails AS (
+        SELECT DISTINCT a.email
+        FROM {_ACCOUNTS_TABLE} a
+        JOIN {_JOBS_TABLE}     j ON a.id          = j.user_id
+        JOIN {_LOCS_TABLE}     l ON j.location_id = l.id
+        WHERE l.company_id = {company_id}
+          AND j.level = 'manager'
+          AND a.email IS NOT NULL
+    ),
+    company_customers AS (
         SELECT DISTINCT customer AS stripe_customer
         FROM {_SUB_TABLE}
         WHERE {_META_CO_ID} = '{company_id}'
@@ -1018,6 +1020,11 @@ def check_payment_method_on_file(company_id: int) -> Dict[str, Any]:
         FROM {_CHG_TABLE}
         WHERE {_META_CO_ID} = '{company_id}'
           AND customer IS NOT NULL
+        UNION
+        SELECT DISTINCT sc.id AS stripe_customer
+        FROM {_CUST_TABLE} sc
+        JOIN manager_emails me ON LOWER(sc.email) = LOWER(me.email)
+        WHERE sc.id IS NOT NULL
     )
     SELECT
         cc.stripe_customer,
