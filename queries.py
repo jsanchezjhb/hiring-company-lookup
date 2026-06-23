@@ -732,3 +732,290 @@ def check_fingerprint_reuse(company_id: int) -> Dict[str, Any]:
         return _result("ALERT" if flagged else "CLEAR", msg, df, n_accounts)
     except Exception as exc:
         return _error(exc)
+
+
+# ===========================================================================
+# Account & Employee constants
+# ===========================================================================
+# Used by Signals 10–14.
+# Join chain: accounts → jobs → locations (company_id)
+# Email/phone verification is on the accounts table itself:
+#   Email verified : confirmed_at IS NOT NULL
+#   Phone verified : needs_phone_confirmation = false
+
+_ACCOUNTS_TABLE  = "prod_redshift_replica.postgres.accounts"
+_JOBS_TABLE      = "prod_redshift_replica.postgres.jobs"
+_LOCS_TABLE      = "prod_redshift_replica.postgres.locations"
+_TIMECARDS_TABLE = "prod_redshift_replica.postgres.timecards"
+_ONBOARD_DOCS    = "prod_redshift_replica.postgres.employee_onboarding_documents"
+
+# Email domains historically associated with fraudulent / disposable accounts.
+# Sourced from the mail.com family of free-email providers + known bad-actor patterns.
+_FRAUD_DOMAINS_SQL = (
+    "'mail.com', 'engineer.com', 'usa.com', 'consultant.com', 'myself.com', "
+    "'dr.com', 'post.com', 'techie.com', 'writeme.com', 'cheerful.com'"
+)
+
+
+# ---------------------------------------------------------------------------
+# Signal 10 — Suspicious Email Domains
+# ---------------------------------------------------------------------------
+
+def check_suspicious_email_domains(company_id: int) -> Dict[str, Any]:
+    """
+    ALERT if the owner or any employee is using an email domain
+    historically associated with fraudulent or disposable accounts.
+    Domain extracted via SPLIT(email, '@')[1] (0-indexed array).
+    """
+    sql = f"""
+    SELECT DISTINCT
+        a.id                                   AS account_id,
+        a.email,
+        LOWER(SPLIT(a.email, '@')[1])          AS email_domain,
+        j.level                                AS user_role
+    FROM {_ACCOUNTS_TABLE} a
+    JOIN {_JOBS_TABLE}      j ON a.id          = j.user_id
+    JOIN {_LOCS_TABLE}      l ON j.location_id = l.id
+    WHERE l.company_id = {company_id}
+      AND LOWER(SPLIT(a.email, '@')[1]) IN ({_FRAUD_DOMAINS_SQL})
+    ORDER BY j.level, a.email
+    """
+    try:
+        df = run_query(sql)
+        count = len(df)
+        flagged = count > 0
+        msg = (
+            f"{count} account{'s' if count != 1 else ''} using a known fraud-associated email domain"
+            if flagged else
+            "No suspicious email domains detected"
+        )
+        return _result("ALERT" if flagged else "CLEAR", msg, df, count)
+    except Exception as exc:
+        return _error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Signal 11 — Owner Email / Phone Verification
+# ---------------------------------------------------------------------------
+
+def check_owner_verification(company_id: int) -> Dict[str, Any]:
+    """
+    ALERT if the owner account has not verified their email or phone number.
+    Email verified : confirmed_at IS NOT NULL
+    Phone verified : needs_phone_confirmation = false
+    """
+    sql = f"""
+    SELECT DISTINCT
+        a.id                                                                   AS account_id,
+        a.email,
+        a.phone,
+        CASE WHEN a.confirmed_at IS NOT NULL      THEN 'Verified' ELSE 'NOT VERIFIED' END AS email_verified,
+        CASE WHEN a.needs_phone_confirmation = false THEN 'Verified' ELSE 'NOT VERIFIED' END AS phone_verified,
+        a.confirmed_at                                                         AS email_verified_at
+    FROM {_ACCOUNTS_TABLE} a
+    JOIN {_JOBS_TABLE}      j ON a.id          = j.user_id
+    JOIN {_LOCS_TABLE}      l ON j.location_id = l.id
+    WHERE l.company_id = {company_id}
+      AND j.level = 'owner'
+      AND (a.confirmed_at IS NULL OR a.needs_phone_confirmation = true)
+    """
+    try:
+        df = run_query(sql)
+        count = len(df)
+        flagged = count > 0
+        if flagged and not df.empty:
+            parts = []
+            if "email_verified" in df.columns and (df["email_verified"] == "NOT VERIFIED").any():
+                parts.append("email unverified")
+            if "phone_verified" in df.columns and (df["phone_verified"] == "NOT VERIFIED").any():
+                parts.append("phone unverified")
+            msg = f"Owner account: {' + '.join(parts) if parts else 'verification incomplete'}"
+        else:
+            msg = "Owner email and phone are both verified"
+        return _result("ALERT" if flagged else "CLEAR", msg, df, count)
+    except Exception as exc:
+        return _error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Signal 12 — Employee Email / Phone Verification
+# ---------------------------------------------------------------------------
+
+def check_employee_verification(company_id: int) -> Dict[str, Any]:
+    """
+    ALERT if any employee or manager account has an unverified email or phone.
+    """
+    sql = f"""
+    SELECT DISTINCT
+        a.id                                                                   AS account_id,
+        a.email,
+        a.phone,
+        j.level                                                                AS user_role,
+        CASE WHEN a.confirmed_at IS NOT NULL      THEN 'Verified' ELSE 'NOT VERIFIED' END AS email_verified,
+        CASE WHEN a.needs_phone_confirmation = false THEN 'Verified' ELSE 'NOT VERIFIED' END AS phone_verified
+    FROM {_ACCOUNTS_TABLE} a
+    JOIN {_JOBS_TABLE}      j ON a.id          = j.user_id
+    JOIN {_LOCS_TABLE}      l ON j.location_id = l.id
+    WHERE l.company_id = {company_id}
+      AND j.level != 'owner'
+      AND (a.confirmed_at IS NULL OR a.needs_phone_confirmation = true)
+    ORDER BY j.level, a.email
+    """
+    try:
+        df = run_query(sql)
+        count = len(df)
+        flagged = count > 0
+        msg = (
+            f"{count} employee account{'s' if count != 1 else ''} with unverified email or phone"
+            if flagged else
+            "All employee accounts have verified contact details"
+        )
+        return _result("ALERT" if flagged else "CLEAR", msg, df, count)
+    except Exception as exc:
+        return _error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Signal 13 — Suspicious Timecard Patterns
+# ---------------------------------------------------------------------------
+
+def check_suspicious_timecards(company_id: int) -> Dict[str, Any]:
+    """
+    ALERT if any timecards were NOT entered by a manager (clock_in_source != 'manager').
+    Also flags rows matching an exact 9:00–17:00 Mon–Fri template pattern, which
+    is consistent with fabricated / bulk-generated punch records.
+
+    DAYOFWEEK() convention in Databricks SQL: 1=Sun, 2=Mon, ..., 7=Sat
+    """
+    sql = f"""
+    SELECT
+        tc.id                       AS timecard_id,
+        j.user_id,
+        j.level                     AS user_role,
+        tc.start_at,
+        tc.end_at,
+        tc.clock_in_source,
+        tc.clock_out_source,
+        tc.approved,
+        DAYOFWEEK(tc.start_at)      AS day_of_week,
+        HOUR(tc.start_at)           AS start_hour,
+        MINUTE(tc.start_at)         AS start_minute,
+        HOUR(tc.end_at)             AS end_hour,
+        MINUTE(tc.end_at)           AS end_minute,
+        CASE WHEN
+            HOUR(tc.start_at)  = 9  AND MINUTE(tc.start_at) <= 5
+            AND HOUR(tc.end_at) = 17 AND MINUTE(tc.end_at)  <= 5
+            AND DAYOFWEEK(tc.start_at) BETWEEN 2 AND 6
+        THEN true ELSE false END    AS exact_9to5_weekday
+    FROM {_TIMECARDS_TABLE} tc
+    JOIN {_JOBS_TABLE}       j  ON tc.job_id      = j.id
+    JOIN {_LOCS_TABLE}       l  ON j.location_id  = l.id
+    WHERE l.company_id = {company_id}
+      AND tc.clock_in_source IS NOT NULL
+      AND tc.clock_in_source != 'manager'
+      AND tc.start_at IS NOT NULL
+      AND tc.end_at   IS NOT NULL
+    ORDER BY tc.start_at DESC
+    LIMIT 500
+    """
+    try:
+        df = run_query(sql)
+        count = len(df)
+        flagged = count > 0
+        if flagged:
+            suspicious = int(df["exact_9to5_weekday"].sum()) if "exact_9to5_weekday" in df.columns else 0
+            pct = round(100 * suspicious / count, 1) if count > 0 else 0.0
+            msg = (
+                f"{count} non-manager timecard{'s' if count != 1 else ''} found; "
+                f"{suspicious} ({pct}%) match exact 9–5 Mon–Fri template pattern"
+            )
+        else:
+            msg = "All timecards entered by manager — no self-punch entries detected"
+        return _result("ALERT" if flagged else "CLEAR", msg, df, count)
+    except Exception as exc:
+        return _error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Signal 14 — Employee Onboarding Documents on File
+# ---------------------------------------------------------------------------
+
+def check_employee_documents(company_id: int) -> Dict[str, Any]:
+    """
+    ALERT if any onboarding documents are already uploaded for this company.
+    For brand-new companies, pre-uploaded documents warrant verification —
+    they may be forged or uploaded to falsely establish legitimacy.
+    """
+    sql = f"""
+    SELECT
+        eod.id                            AS document_id,
+        eod.user_id,
+        eod.category,
+        eod.filename,
+        eod.uploaded_by_id,
+        eod.acknowledged_at,
+        CAST(eod.created_at AS TIMESTAMP) AS uploaded_at
+    FROM {_ONBOARD_DOCS} eod
+    WHERE eod.company_id = {company_id}
+    ORDER BY eod.created_at DESC
+    """
+    try:
+        df = run_query(sql)
+        count = len(df)
+        flagged = count > 0
+        msg = (
+            f"{count} onboarding document{'s' if count != 1 else ''} on file — verify authenticity"
+            if flagged else
+            "No employee onboarding documents found"
+        )
+        return _result("ALERT" if flagged else "CLEAR", msg, df, count)
+    except Exception as exc:
+        return _error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Signal 15 — Payment Method on File
+# ---------------------------------------------------------------------------
+
+def check_payment_method_on_file(company_id: int) -> Dict[str, Any]:
+    """
+    ALERT if no Stripe payment method is on file for this company.
+    A new company attempting to use a paid Hiring feature without
+    a payment method configured is a potential fraud signal.
+    Uses the same customer_subscription linkage as Signals 6–9.
+    """
+    sql = f"""
+    WITH {_company_customers_cte(company_id)}
+    SELECT
+        cc.stripe_customer,
+        COUNT(c.id)                                                    AS total_charges,
+        SUM(CASE WHEN c.status = 'succeeded' THEN 1 ELSE 0 END)       AS successful_charges,
+        SUM(CASE WHEN c.status = 'failed'    THEN 1 ELSE 0 END)       AS failed_charges,
+        MIN(FROM_UNIXTIME(c.created))                                  AS first_charge_at,
+        MAX(FROM_UNIXTIME(c.created))                                  AS last_charge_at
+    FROM company_customers cc
+    LEFT JOIN {_CHG_TABLE} c ON c.customer = cc.stripe_customer
+    GROUP BY cc.stripe_customer
+    """
+    try:
+        df = run_query(sql)
+        if df.empty:
+            return _result(
+                "ALERT",
+                "No Stripe customer record found — no payment method on file",
+                pd.DataFrame(),
+                0,
+            )
+        total      = int(df["total_charges"].sum())      if "total_charges"      in df.columns else 0
+        successful = int(df["successful_charges"].sum()) if "successful_charges" in df.columns else 0
+        if total == 0:
+            return _result(
+                "ALERT",
+                "Stripe customer linked but no charges on record — payment method may not be active",
+                df,
+                0,
+            )
+        msg = f"Payment method on file — {total} charge{'s' if total != 1 else ''} ({successful} successful)"
+        return _result("CLEAR", msg, df, total)
+    except Exception as exc:
+        return _error(exc)
