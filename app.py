@@ -253,7 +253,7 @@ def main():
             ("📧", "Suspicious Email Domains",      "Owner or employees using known fraud-associated domains"),
             ("👤", "Owner Verification",            "Owner email or phone not verified"),
             ("👥", "Employee Verification",         "Employee accounts with unverified contact details"),
-            ("🕐", "Suspicious Timecards",          "Non-manager punch entries or exact 9–5 Mon–Fri pattern"),
+            ("🕐", "Suspicious Timecard Overrides", "Manager entered 3+ punches in the last pay period"),
             ("📁", "Employee Documents",            "Onboarding documents pre-uploaded on a new account"),
             ("💰", "Payment Method on File",        "No Stripe payment method linked to this company"),
         ]
@@ -477,11 +477,12 @@ def main():
 
     signal_card(
         icon="🕐",
-        title="Suspicious Timecard Patterns",
+        title="Suspicious Manager Timecard Overrides",
         description=(
-            "Flags timecard entries that were NOT submitted by a manager (clock_in_source ≠ 'manager'). "
-            "Within those, highlights records matching an exact 9:00–17:00 Mon–Fri template pattern — "
-            "consistent with fabricated or auto-generated punch data used to appear legitimate."
+            "Flags when a manager entered more than 3 timecard punches in the last 14 days "
+            "(proxy for one pay period). Employees are expected to clock themselves in — "
+            "a manager override is an exception. More than 3 in a pay period may indicate "
+            "fabricated or adjusted records."
         ),
         result=results["suspicious_timecards"],
     )
