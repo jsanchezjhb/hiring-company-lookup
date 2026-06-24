@@ -835,6 +835,17 @@ def check_fingerprint_reuse(company_id: int) -> Dict[str, Any]:
     """
     try:
         df         = run_query(sql)
+
+        # Deduplicate: one row per (fingerprint, other_stripe_customer).
+        # When the same card is found via multiple sources, keep the most direct one.
+        if not df.empty and "match_source" in df.columns:
+            _priority = {"stored_card": 0, "payment_method": 1, "charge": 2}
+            df["_sort"] = df["match_source"].map(_priority).fillna(99)
+            df = (df.sort_values("_sort")
+                    .drop_duplicates(subset=["fingerprint", "other_stripe_customer"])
+                    .drop(columns="_sort")
+                    .reset_index(drop=True))
+
         flagged    = not df.empty
         n_prints   = df["fingerprint"].nunique()        if flagged else 0
         n_accounts = df["other_company_id"].nunique()   if flagged else 0
