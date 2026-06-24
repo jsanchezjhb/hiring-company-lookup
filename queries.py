@@ -815,6 +815,7 @@ def check_suspicious_email_domains(company_id: int) -> Dict[str, Any]:
     JOIN {_JOBS_TABLE}      j ON a.id          = j.user_id
     JOIN {_LOCS_TABLE}      l ON j.location_id = l.id
     WHERE l.company_id = {company_id}
+      AND j.archived_at IS NULL
       AND LOWER(SPLIT(a.email, '@')[1]) IN ({_FRAUD_DOMAINS_SQL})
     ORDER BY user_role, a.email
     """
@@ -855,6 +856,7 @@ def check_owner_verification(company_id: int) -> Dict[str, Any]:
     JOIN {_JOBS_TABLE}      j ON a.id          = j.user_id
     JOIN {_LOCS_TABLE}      l ON j.location_id = l.id
     WHERE l.company_id = {company_id}
+      AND j.archived_at IS NULL
       AND LOWER(j.level) = 'manager'
       AND (a.confirmed_at IS NULL OR a.needs_phone_confirmation = true)
     ORDER BY account_id
@@ -901,6 +903,7 @@ def check_employee_verification(company_id: int) -> Dict[str, Any]:
     JOIN {_JOBS_TABLE}      j ON a.id          = j.user_id
     JOIN {_LOCS_TABLE}      l ON j.location_id = l.id
     WHERE l.company_id = {company_id}
+      AND j.archived_at IS NULL
       AND LOWER(j.level) NOT IN ('owner', 'employer')
       AND (a.email IS NOT NULL OR a.phone IS NOT NULL)
     ORDER BY user_role, a.email
@@ -952,6 +955,7 @@ def check_suspicious_timecards(company_id: int) -> Dict[str, Any]:
     JOIN {_JOBS_TABLE}       j  ON tc.job_id      = j.id
     JOIN {_LOCS_TABLE}       l  ON j.location_id  = l.id
     WHERE l.company_id = {company_id}
+      AND j.archived_at IS NULL
       AND tc.clock_in_source = 'manager'
       AND tc.start_at >= DATE_SUB(CURRENT_DATE(), 14)
       AND tc.start_at IS NOT NULL
@@ -1033,6 +1037,7 @@ def check_payment_method_on_file(company_id: int) -> Dict[str, Any]:
         JOIN {_JOBS_TABLE}     j ON a.id          = j.user_id
         JOIN {_LOCS_TABLE}     l ON j.location_id = l.id
         WHERE l.company_id = {company_id}
+          AND j.archived_at IS NULL
           AND LOWER(j.level) = 'manager'
           AND a.email IS NOT NULL
     ),
