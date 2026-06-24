@@ -970,41 +970,53 @@ def check_employee_verification(company_id: int) -> Dict[str, Any]:
 def check_suspicious_timecards(company_id: int) -> Dict[str, Any]:
     """
     ALERT if a manager entered more than 3 timecard punches in the last 14 days.
-    Query filters company → locations → jobs first (small sets) before touching
-    the large timecards table, avoiding a full table scan.
+    Uses a two-step approach to avoid a full timecards table scan:
+      Step 1: fetch job IDs for this company (fast — small result)
+      Step 2: query timecards WHERE job_id IN (...) using the explicit ID list
+    Short-circuits immediately if the company has no active jobs.
     """
     THRESHOLD = 3
-    sql = f"""
-    WITH company_jobs AS (
-        SELECT j.id AS job_id, j.user_id, j.level
-        FROM {_JOBS_TABLE}  j
-        JOIN {_LOCS_TABLE}  l ON j.location_id = l.id
-        WHERE l.company_id  = {company_id}
-          AND j.archived_at IS NULL
-    )
-    SELECT
-        tc.id                       AS timecard_id,
-        cj.user_id,
-        cj.level                    AS user_role,
-        tc.start_at,
-        tc.end_at,
-        tc.clock_in_source,
-        tc.clock_out_source,
-        tc.approved,
-        DAYOFWEEK(tc.start_at)      AS day_of_week,
-        HOUR(tc.start_at)           AS start_hour,
-        HOUR(tc.end_at)             AS end_hour
-    FROM {_TIMECARDS_TABLE} tc
-    JOIN company_jobs cj ON tc.job_id = cj.job_id
-    WHERE tc.clock_in_source = 'manager'
-      AND tc.start_at >= CURRENT_DATE - INTERVAL 14 DAYS
-      AND tc.start_at IS NOT NULL
-      AND tc.end_at   IS NOT NULL
-    ORDER BY tc.start_at DESC
-    LIMIT 100
+
+    # Step 1 — get job IDs for this company
+    jobs_sql = f"""
+    SELECT j.id AS job_id
+    FROM {_LOCS_TABLE} l
+    JOIN {_JOBS_TABLE} j ON j.location_id = l.id
+    WHERE l.company_id = {company_id}
+      AND j.archived_at IS NULL
     """
     try:
-        df = run_query(sql)
+        jobs_df = run_query(jobs_sql)
+        if jobs_df.empty:
+            return _result("CLEAR", "No active jobs found for this company", pd.DataFrame(), 0)
+
+        job_ids = ", ".join(str(jid) for jid in jobs_df["job_id"].tolist())
+
+        # Step 2 — query timecards only for those specific job IDs
+        tc_sql = f"""
+        SELECT
+            tc.id                       AS timecard_id,
+            j.user_id,
+            j.level                     AS user_role,
+            tc.start_at,
+            tc.end_at,
+            tc.clock_in_source,
+            tc.clock_out_source,
+            tc.approved,
+            DAYOFWEEK(tc.start_at)      AS day_of_week,
+            HOUR(tc.start_at)           AS start_hour,
+            HOUR(tc.end_at)             AS end_hour
+        FROM {_TIMECARDS_TABLE} tc
+        JOIN {_JOBS_TABLE} j ON tc.job_id = j.id
+        WHERE tc.job_id IN ({job_ids})
+          AND tc.clock_in_source = 'manager'
+          AND tc.start_at >= CURRENT_DATE - INTERVAL 14 DAYS
+          AND tc.start_at IS NOT NULL
+          AND tc.end_at   IS NOT NULL
+        ORDER BY tc.start_at DESC
+        LIMIT 100
+        """
+        df    = run_query(tc_sql)
         count = len(df)
         flagged = count > THRESHOLD
         if flagged:
