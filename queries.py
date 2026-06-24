@@ -573,7 +573,7 @@ def check_dormancy_reactivation(company_id: int) -> Dict[str, Any]:
 
 _SUB_TABLE     = "prod_redshift_replica.stripe.customer_subscription"  # company → customer
 _CHG_TABLE     = "prod_redshift_replica.stripe.charge"                 # Signals 6, 7, 8, 9
-_DISPUTE_TABLE = "prod_redshift_replica.stripe.dispute"                # Signal 7 — direct dispute lookup
+_DISPUTE_TABLE = "prod_redshift_replica.stripe.i_charge_dispute"       # Signal 7 — direct dispute lookup
 _CUST_TABLE    = "prod_redshift_replica.stripe.customer"               # Signal 15 email lookup
 _CO_TABLE      = "prod_redshift_replica.public.companies"              # Signal 9 name lookup
 
