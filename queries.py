@@ -613,8 +613,10 @@ def check_dormancy_reactivation(company_id: int) -> Dict[str, Any]:
 
 _SUB_TABLE     = "prod_redshift_replica.stripe.customer_subscription"  # company → customer
 _CHG_TABLE     = "prod_redshift_replica.stripe.charge"                 # Signals 6, 7, 8, 9
-_DISPUTE_TABLE = "prod_redshift_replica.stripe.i_charge_dispute"               # Signal 7 — direct dispute lookup
-_CUST_TABLE    = "prod_redshift_replica.stripe.customer"               # Signal 15 email lookup
+_DISPUTE_TABLE = "prod_redshift_replica.stripe.i_charge_dispute"       # Signal 7 — direct dispute lookup
+_CUST_TABLE    = "prod_redshift_replica.stripe.customer"               # Signal 15 customer lookup
+_CUST_SRC_TABLE= "prod_redshift_replica.stripe.customer_source"        # Signals 9, 15 — stored cards (fingerprint col)
+_PM_TABLE      = "prod_redshift_replica.stripe.payment_method"         # Signals 9, 15 — PaymentMethod API cards
 _CO_TABLE      = "prod_redshift_replica.public.companies"              # Signal 9 name lookup
 
 # customer_subscription.metadata contains company_id as a JSON string:
@@ -754,57 +756,88 @@ def check_payment_method_changes(company_id: int) -> Dict[str, Any]:
 
 def check_fingerprint_reuse(company_id: int) -> Dict[str, Any]:
     """
-    ALERT if a card fingerprint on this company's charges also appears on
-    charges from other companies — strong indicator of fraud ring activity.
-    Fingerprint extracted from: GET_JSON_OBJECT(payment_method_details, '$.card.fingerprint')
-    Cross-company scan is limited to the last 2 years to avoid a full table scan.
+    ALERT if any card fingerprint associated with this company's Stripe customer
+    also appears on another company's customer.
+
+    Checks three sources so saved-but-uncharged cards are also caught:
+      1. customer_source.fingerprint     — legacy stored cards (direct column)
+      2. payment_method.card fingerprint — PaymentMethod API cards (JSON)
+      3. charge payment_method_details   — historical charge fingerprints
+
+    row_deleted_at IS NULL filters active records in customer_source / payment_method.
+    Charge scan is limited to 6 months to avoid a full table scan.
     """
-    six_months_ago_epoch = "UNIX_TIMESTAMP() - 15768000"
     sql = f"""
     WITH {_company_customers_cte(company_id)},
+
     target_fps AS (
-        SELECT
-            GET_JSON_OBJECT(c.payment_method_details, {_FINGERPRINT_PATH}) AS fingerprint,
-            MIN(FROM_UNIXTIME(c.created)) AS first_used_on_this_account
-        FROM {_CHG_TABLE} c
-        INNER JOIN company_customers cc ON cc.stripe_customer = c.customer
-        WHERE GET_JSON_OBJECT(c.payment_method_details, {_FINGERPRINT_PATH}) IS NOT NULL
-        GROUP BY GET_JSON_OBJECT(c.payment_method_details, {_FINGERPRINT_PATH})
+        SELECT DISTINCT fingerprint
+        FROM {_CUST_SRC_TABLE}
+        WHERE customer IN (SELECT stripe_customer FROM company_customers)
+          AND fingerprint IS NOT NULL
+          AND row_deleted_at IS NULL
+
+        UNION
+
+        SELECT DISTINCT GET_JSON_OBJECT(card, '$.fingerprint') AS fingerprint
+        FROM {_PM_TABLE}
+        WHERE customer IN (SELECT stripe_customer FROM company_customers)
+          AND GET_JSON_OBJECT(card, '$.fingerprint') IS NOT NULL
+          AND row_deleted_at IS NULL
+
+        UNION
+
+        SELECT DISTINCT GET_JSON_OBJECT(payment_method_details, {_FINGERPRINT_PATH}) AS fingerprint
+        FROM {_CHG_TABLE}
+        WHERE customer IN (SELECT stripe_customer FROM company_customers)
+          AND GET_JSON_OBJECT(payment_method_details, {_FINGERPRINT_PATH}) IS NOT NULL
     ),
-    other_matches AS (
-        SELECT
-            GET_JSON_OBJECT(c.payment_method_details, {_FINGERPRINT_PATH}) AS fingerprint,
-            CAST(GET_JSON_OBJECT(s.metadata, '$.company_id') AS INT)        AS other_company_id,
-            MIN(FROM_UNIXTIME(c.created))                                   AS first_seen_at
+
+    other_customers AS (
+        SELECT DISTINCT cs.customer, tf.fingerprint, 'stored_card' AS match_source
+        FROM {_CUST_SRC_TABLE} cs
+        INNER JOIN target_fps tf ON tf.fingerprint = cs.fingerprint
+        WHERE cs.customer NOT IN (SELECT stripe_customer FROM company_customers)
+          AND cs.row_deleted_at IS NULL
+
+        UNION
+
+        SELECT DISTINCT pm.customer, tf.fingerprint, 'payment_method' AS match_source
+        FROM {_PM_TABLE} pm
+        INNER JOIN target_fps tf ON tf.fingerprint = GET_JSON_OBJECT(pm.card, '$.fingerprint')
+        WHERE pm.customer NOT IN (SELECT stripe_customer FROM company_customers)
+          AND pm.row_deleted_at IS NULL
+
+        UNION
+
+        SELECT DISTINCT c.customer, tf.fingerprint, 'charge' AS match_source
         FROM {_CHG_TABLE} c
-        INNER JOIN {_SUB_TABLE} s  ON s.customer = c.customer
-        INNER JOIN target_fps   tf ON tf.fingerprint
-                                    = GET_JSON_OBJECT(c.payment_method_details, {_FINGERPRINT_PATH})
-        WHERE GET_JSON_OBJECT(s.metadata, '$.company_id') != '{company_id}'
-          AND GET_JSON_OBJECT(s.metadata, '$.company_id') IS NOT NULL
-          AND GET_JSON_OBJECT(c.payment_method_details, {_FINGERPRINT_PATH}) IS NOT NULL
-          AND c.created >= {six_months_ago_epoch}
-        GROUP BY
-            GET_JSON_OBJECT(c.payment_method_details, {_FINGERPRINT_PATH}),
-            GET_JSON_OBJECT(s.metadata, '$.company_id')
+        INNER JOIN target_fps tf ON tf.fingerprint
+                                  = GET_JSON_OBJECT(c.payment_method_details, {_FINGERPRINT_PATH})
+        WHERE c.customer NOT IN (SELECT stripe_customer FROM company_customers)
+          AND c.created >= UNIX_TIMESTAMP() - 15768000
     )
+
     SELECT
-        om.fingerprint,
-        om.other_company_id,
-        co.name                         AS other_company_name,
-        om.first_seen_at                AS first_seen_at_other_account,
-        tf.first_used_on_this_account
-    FROM other_matches om
-    INNER JOIN target_fps tf ON tf.fingerprint = om.fingerprint
-    LEFT JOIN {_CO_TABLE} co ON co.company_id  = om.other_company_id
-    ORDER BY om.first_seen_at DESC
+        oc.fingerprint,
+        oc.customer                                              AS other_stripe_customer,
+        oc.match_source,
+        GET_JSON_OBJECT(s.metadata, '$.company_id')             AS other_company_id,
+        co.name                                                  AS other_company_name
+    FROM other_customers oc
+    INNER JOIN {_SUB_TABLE} s ON s.customer = oc.customer
+    LEFT JOIN {_CO_TABLE} co
+           ON CAST(co.company_id AS STRING) = GET_JSON_OBJECT(s.metadata, '$.company_id')
+    WHERE GET_JSON_OBJECT(s.metadata, '$.company_id') IS NOT NULL
+      AND GET_JSON_OBJECT(s.metadata, '$.company_id') != '{company_id}'
+    ORDER BY oc.fingerprint, oc.match_source
     LIMIT 100
     """
     try:
         df         = run_query(sql)
         flagged    = not df.empty
-        n_prints   = df["fingerprint"].nunique()      if flagged else 0
-        n_accounts = df["other_company_id"].nunique() if flagged else 0
+        n_prints   = df["fingerprint"].nunique()        if flagged else 0
+        n_accounts = df["other_company_id"].nunique()   if flagged else 0
         msg = (
             f"{n_prints} fingerprint{'s' if n_prints != 1 else ''} matched across "
             f"{n_accounts} other account{'s' if n_accounts != 1 else ''}"
@@ -1090,26 +1123,18 @@ def check_employee_documents(company_id: int) -> Dict[str, Any]:
 
 def check_payment_method_on_file(company_id: int) -> Dict[str, Any]:
     """
-    ALERT if no Stripe customer is found, or if the customer has no payment method stored.
-    Payment method presence is determined by stripe.customer.default_source being non-null
-    (covers both legacy card sources and newer PaymentMethod objects).
-    Uses three lookup strategies in a UNION so any one hit is sufficient:
-      1. customer_subscription.metadata company_id match
-      2. charge.metadata company_id match
-      3. stripe.customer.email matches the company's manager account email
+    ALERT if no Stripe customer is found, or if no payment method is stored.
+
+    Customer lookup uses metadata only (subscription + charge) — the email fallback
+    was removed because one email can map to multiple Stripe customers, causing the
+    wrong customer to be returned.
+
+    Payment method presence is checked against customer_source (legacy stored cards,
+    direct fingerprint column) and payment_method (PaymentMethod API, card JSON).
+    This catches saved cards even before any charge has been made.
     """
     sql = f"""
-    WITH manager_emails AS (
-        SELECT DISTINCT a.email
-        FROM {_LOCS_TABLE}     l
-        JOIN {_JOBS_TABLE}     j ON j.location_id = l.id
-        JOIN {_ACCOUNTS_TABLE} a ON a.id          = j.user_id
-        WHERE l.company_id  = {company_id}
-          AND j.archived_at IS NULL
-          AND LOWER(j.level) = 'manager'
-          AND a.email IS NOT NULL
-    ),
-    company_customers AS (
+    WITH company_customers AS (
         SELECT DISTINCT customer AS stripe_customer
         FROM {_SUB_TABLE}
         WHERE {_META_CO_ID} = '{company_id}'
@@ -1119,24 +1144,35 @@ def check_payment_method_on_file(company_id: int) -> Dict[str, Any]:
         FROM {_CHG_TABLE}
         WHERE {_META_CO_ID} = '{company_id}'
           AND customer IS NOT NULL
-        UNION
-        SELECT DISTINCT sc.id AS stripe_customer
-        FROM {_CUST_TABLE} sc
-        JOIN manager_emails me ON LOWER(sc.email) = LOWER(me.email)
-        WHERE sc.id IS NOT NULL
+    ),
+    stored_pms AS (
+        SELECT cs.customer, cs.id AS pm_id, cs.fingerprint, 'customer_source' AS pm_type
+        FROM {_CUST_SRC_TABLE} cs
+        INNER JOIN company_customers cc ON cc.stripe_customer = cs.customer
+        WHERE cs.row_deleted_at IS NULL
+          AND cs.fingerprint IS NOT NULL
+
+        UNION ALL
+
+        SELECT pm.customer, pm.id AS pm_id,
+               GET_JSON_OBJECT(pm.card, '$.fingerprint') AS fingerprint,
+               'payment_method' AS pm_type
+        FROM {_PM_TABLE} pm
+        INNER JOIN company_customers cc ON cc.stripe_customer = pm.customer
+        WHERE pm.row_deleted_at IS NULL
+          AND GET_JSON_OBJECT(pm.card, '$.fingerprint') IS NOT NULL
     )
     SELECT
         cc.stripe_customer,
-        COUNT(DISTINCT CASE WHEN c.payment_method IS NOT NULL
-                            THEN c.payment_method END)             AS payment_methods_count,
-        COUNT(c.id)                                                AS total_charges,
-        SUM(CASE WHEN c.status = 'succeeded' THEN 1 ELSE 0 END)   AS successful_charges,
-        SUM(CASE WHEN c.status = 'failed'    THEN 1 ELSE 0 END)   AS failed_charges,
-        MIN(FROM_UNIXTIME(c.created))                              AS first_charge_at,
-        MAX(FROM_UNIXTIME(c.created))                              AS last_charge_at
+        COUNT(DISTINCT spm.fingerprint)                             AS payment_methods_count,
+        COUNT(c.id)                                                 AS total_charges,
+        SUM(CASE WHEN c.status = 'succeeded' THEN 1 ELSE 0 END)    AS successful_charges,
+        SUM(CASE WHEN c.status = 'failed'    THEN 1 ELSE 0 END)    AS failed_charges,
+        MIN(FROM_UNIXTIME(c.created))                               AS first_charge_at,
+        MAX(FROM_UNIXTIME(c.created))                               AS last_charge_at
     FROM company_customers cc
-    LEFT JOIN {_CUST_TABLE}  sc ON sc.id      = cc.stripe_customer
-    LEFT JOIN {_CHG_TABLE}   c  ON c.customer = cc.stripe_customer
+    LEFT JOIN stored_pms spm ON spm.customer = cc.stripe_customer
+    LEFT JOIN {_CHG_TABLE} c ON c.customer   = cc.stripe_customer
     GROUP BY cc.stripe_customer
     """
     try:
