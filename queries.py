@@ -571,10 +571,11 @@ def check_dormancy_reactivation(company_id: int) -> Dict[str, Any]:
 # Tables confirmed from SHOW TABLES IN prod_redshift_replica.stripe
 # Company linkage: GET_JSON_OBJECT(metadata, '$.company_id') on customer_subscription
 
-_SUB_TABLE  = "prod_redshift_replica.stripe.customer_subscription"  # company → customer
-_CHG_TABLE  = "prod_redshift_replica.stripe.charge"                 # Signals 6, 7, 8, 9
-_CUST_TABLE = "prod_redshift_replica.stripe.customer"               # Signal 15 email lookup
-_CO_TABLE   = "prod_redshift_replica.public.companies"              # Signal 9 name lookup
+_SUB_TABLE     = "prod_redshift_replica.stripe.customer_subscription"  # company → customer
+_CHG_TABLE     = "prod_redshift_replica.stripe.charge"                 # Signals 6, 7, 8, 9
+_DISPUTE_TABLE = "prod_redshift_replica.stripe.dispute"                # Signal 7 — direct dispute lookup
+_CUST_TABLE    = "prod_redshift_replica.stripe.customer"               # Signal 15 email lookup
+_CO_TABLE      = "prod_redshift_replica.public.companies"              # Signal 9 name lookup
 
 # customer_subscription.metadata contains company_id as a JSON string:
 #   {"company_id":"1311802","location_id":"1415801", ...}
@@ -638,28 +639,34 @@ def check_failed_billing(company_id: int) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def check_billing_disputes(company_id: int) -> Dict[str, Any]:
-    """ALERT if any Stripe charge for this company has been disputed."""
+    """
+    ALERT if any Stripe dispute exists for this company's charges.
+    Queries stripe.dispute directly (joined through charge → customer) rather than
+    relying on the charge.disputed boolean, which is not reliably synced in Fivetran.
+    """
     sql = f"""
     WITH {_company_customers_cte(company_id)}
     SELECT
-        c.id                            AS charge_id,
-        ROUND(c.amount / 100.0, 2)      AS charge_amount_usd,
-        UPPER(c.currency)               AS currency,
-        c.status                        AS charge_status,
-        FROM_UNIXTIME(c.created)        AS charged_at,
+        d.id                            AS dispute_id,
+        d.charge                        AS charge_id,
+        ROUND(d.amount / 100.0, 2)      AS dispute_amount_usd,
+        UPPER(d.currency)               AS currency,
+        d.reason,
+        d.status                        AS dispute_status,
+        FROM_UNIXTIME(d.created)        AS disputed_at,
         c.customer                      AS stripe_customer
-    FROM {_CHG_TABLE} c
+    FROM {_DISPUTE_TABLE} d
+    JOIN {_CHG_TABLE} c ON c.id = d.charge
     INNER JOIN company_customers cc ON cc.stripe_customer = c.customer
-    WHERE c.disputed = true
-    ORDER BY c.created DESC
+    ORDER BY d.created DESC
     """
     try:
         df      = run_query(sql)
         count   = len(df)
         flagged = count > 0
         if flagged:
-            total_usd = df["charge_amount_usd"].sum() if "charge_amount_usd" in df.columns else 0
-            msg = f"{count} disputed charge{'s' if count != 1 else ''} (total: ${total_usd:,.2f})"
+            total_usd = df["dispute_amount_usd"].sum() if "dispute_amount_usd" in df.columns else 0
+            msg = f"{count} dispute{'s' if count != 1 else ''} found (total: ${total_usd:,.2f})"
         else:
             msg = "No billing disputes found"
         return _result("ALERT" if flagged else "CLEAR", msg, df, count)
@@ -1047,16 +1054,17 @@ def check_payment_method_on_file(company_id: int) -> Dict[str, Any]:
     )
     SELECT
         cc.stripe_customer,
-        sc.default_source                                                      AS payment_method_on_file,
-        COUNT(c.id)                                                            AS total_charges,
-        SUM(CASE WHEN c.status = 'succeeded' THEN 1 ELSE 0 END)               AS successful_charges,
-        SUM(CASE WHEN c.status = 'failed'    THEN 1 ELSE 0 END)               AS failed_charges,
-        MIN(FROM_UNIXTIME(c.created))                                          AS first_charge_at,
-        MAX(FROM_UNIXTIME(c.created))                                          AS last_charge_at
+        COUNT(DISTINCT CASE WHEN c.payment_method IS NOT NULL
+                            THEN c.payment_method END)             AS payment_methods_count,
+        COUNT(c.id)                                                AS total_charges,
+        SUM(CASE WHEN c.status = 'succeeded' THEN 1 ELSE 0 END)   AS successful_charges,
+        SUM(CASE WHEN c.status = 'failed'    THEN 1 ELSE 0 END)   AS failed_charges,
+        MIN(FROM_UNIXTIME(c.created))                              AS first_charge_at,
+        MAX(FROM_UNIXTIME(c.created))                              AS last_charge_at
     FROM company_customers cc
-    LEFT JOIN {_CUST_TABLE}  sc ON sc.id       = cc.stripe_customer
-    LEFT JOIN {_CHG_TABLE}   c  ON c.customer  = cc.stripe_customer
-    GROUP BY cc.stripe_customer, sc.default_source
+    LEFT JOIN {_CUST_TABLE}  sc ON sc.id      = cc.stripe_customer
+    LEFT JOIN {_CHG_TABLE}   c  ON c.customer = cc.stripe_customer
+    GROUP BY cc.stripe_customer
     """
     try:
         df = run_query(sql)
@@ -1067,20 +1075,16 @@ def check_payment_method_on_file(company_id: int) -> Dict[str, Any]:
                 pd.DataFrame(),
                 0,
             )
-        has_pm = (
-            "payment_method_on_file" in df.columns
-            and df["payment_method_on_file"].notna().any()
-            and (df["payment_method_on_file"] != "").any()
-        )
-        total      = int(df["total_charges"].sum())      if "total_charges"      in df.columns else 0
-        successful = int(df["successful_charges"].sum()) if "successful_charges" in df.columns else 0
+        pm_count   = int(df["payment_methods_count"].sum()) if "payment_methods_count" in df.columns else 0
+        total      = int(df["total_charges"].sum())         if "total_charges"         in df.columns else 0
+        successful = int(df["successful_charges"].sum())    if "successful_charges"    in df.columns else 0
         customer   = df["stripe_customer"].iloc[0]
-        if has_pm:
+        if pm_count > 0:
             msg = (
                 f"Payment method on file ({customer})"
                 + (f" — {total} charge{'s' if total != 1 else ''} ({successful} successful)" if total > 0 else "")
             )
-            return _result("CLEAR", msg, df, total)
+            return _result("CLEAR", msg, df, pm_count)
         else:
             msg = f"Stripe customer found ({customer}) but no payment method on file"
             return _result("ALERT", msg, df, 0)
