@@ -26,6 +26,7 @@ from queries import (
     check_suspicious_timecards,
     check_employee_documents,
     check_payment_method_on_file,
+    check_owner_multi_company,
 )
 
 # ─── Page config (must be first Streamlit call) ───────────────────────────────
@@ -255,6 +256,7 @@ def main():
             ("👥", "Employee Verification",         "Employee accounts with unverified contact details"),
             ("🕐", "Suspicious Timecard Overrides", "Manager entered 3+ punches in the last pay period"),
             ("📁", "Employee Documents",            "Onboarding documents pre-uploaded on a new account"),
+            ("🔗", "Manager Linked to Other Companies", "Manager email/phone found at other company accounts"),
             ("💰", "Payment Method on File",        "No Stripe payment method linked to this company"),
         ]
         for icon, name, desc in signals_info:
@@ -320,6 +322,7 @@ def main():
         "suspicious_timecards":  check_suspicious_timecards,
         "employee_documents":    check_employee_documents,
         "payment_method":        check_payment_method_on_file,
+        "owner_multi_company":   check_owner_multi_company,
     }
 
     # Section layout — defines display order and all card metadata
@@ -388,6 +391,16 @@ def main():
                         "Flags when onboarding documents are already uploaded for a new company. "
                         "Pre-uploaded documents on a brand-new account may be forged or "
                         "uploaded to falsely establish legitimacy — worth verifying."
+                    ),
+                },
+                {
+                    "key": "owner_multi_company", "icon": "🔗",
+                    "title": "Manager Linked to Other Companies",
+                    "description": (
+                        "Checks whether the manager account(s) on this company also appear at other companies — "
+                        "via the same Homebase account, a matching email address, or a matching phone number. "
+                        "Any role at another company (owner, manager, or employee) is flagged. "
+                        "Not a dealbreaker on its own, but warrants investigation."
                     ),
                 },
             ],
