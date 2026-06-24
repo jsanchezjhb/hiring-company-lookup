@@ -640,35 +640,35 @@ def check_failed_billing(company_id: int) -> Dict[str, Any]:
 
 def check_billing_disputes(company_id: int) -> Dict[str, Any]:
     """
-    ALERT if any Stripe dispute exists for this company's charges.
-    Queries stripe.dispute directly (joined through charge → customer) rather than
-    relying on the charge.disputed boolean, which is not reliably synced in Fivetran.
+    ALERT if any Stripe dispute exists for this company.
+    Joins directly on customer_id — no charge table join needed.
+    Column reference confirmed via DESCRIBE i_charge_dispute.
     """
     sql = f"""
     WITH {_company_customers_cte(company_id)}
     SELECT
-        d.id                            AS dispute_id,
-        d.charge_id                     AS charge_id,
-        ROUND(d.amount / 100.0, 2)      AS dispute_amount_usd,
-        UPPER(d.currency)               AS currency,
+        d.dispute_id,
+        d.charge_id,
+        d.amount,
+        d.status               AS dispute_status,
         d.reason,
-        d.status                        AS dispute_status,
-        FROM_UNIXTIME(d.created)        AS disputed_at,
-        c.customer                      AS stripe_customer
+        d.customer_name,
+        d.customer_email,
+        d.created_at           AS disputed_at,
+        d.evidence_due_date
     FROM {_DISPUTE_TABLE} d
-    JOIN {_CHG_TABLE} c ON c.id = d.charge_id
-    INNER JOIN company_customers cc ON cc.stripe_customer = c.customer
-    ORDER BY d.created DESC
+    INNER JOIN company_customers cc ON cc.stripe_customer = d.customer_id
+    ORDER BY d.created_at DESC
     """
     try:
         df      = run_query(sql)
         count   = len(df)
         flagged = count > 0
-        if flagged:
-            total_usd = df["dispute_amount_usd"].sum() if "dispute_amount_usd" in df.columns else 0
-            msg = f"{count} dispute{'s' if count != 1 else ''} found (total: ${total_usd:,.2f})"
-        else:
-            msg = "No billing disputes found"
+        msg = (
+            f"{count} dispute{'s' if count != 1 else ''} found"
+            if flagged else
+            "No billing disputes found"
+        )
         return _result("ALERT" if flagged else "CLEAR", msg, df, count)
     except Exception as exc:
         return _error(exc)
