@@ -719,7 +719,7 @@ def check_fingerprint_reuse(company_id: int) -> Dict[str, Any]:
     Fingerprint extracted from: GET_JSON_OBJECT(payment_method_details, '$.card.fingerprint')
     Cross-company scan is limited to the last 2 years to avoid a full table scan.
     """
-    two_years_ago_epoch = "UNIX_TIMESTAMP() - 63072000"
+    six_months_ago_epoch = "UNIX_TIMESTAMP() - 15768000"
     sql = f"""
     WITH {_company_customers_cte(company_id)},
     target_fps AS (
@@ -743,7 +743,7 @@ def check_fingerprint_reuse(company_id: int) -> Dict[str, Any]:
         WHERE GET_JSON_OBJECT(s.metadata, '$.company_id') != '{company_id}'
           AND GET_JSON_OBJECT(s.metadata, '$.company_id') IS NOT NULL
           AND GET_JSON_OBJECT(c.payment_method_details, {_FINGERPRINT_PATH}) IS NOT NULL
-          AND c.created >= {two_years_ago_epoch}
+          AND c.created >= {six_months_ago_epoch}
         GROUP BY
             GET_JSON_OBJECT(c.payment_method_details, {_FINGERPRINT_PATH}),
             GET_JSON_OBJECT(s.metadata, '$.company_id')
@@ -780,7 +780,8 @@ def check_fingerprint_reuse(company_id: int) -> Dict[str, Any]:
 # Account & Employee constants
 # ===========================================================================
 # Used by Signals 10–14.
-# Join chain: accounts → jobs → locations (company_id)
+# IMPORTANT: join order is locations → jobs → accounts (company filter first)
+# to avoid full-scanning the large accounts table.
 # Email/phone verification is on the accounts table itself:
 #   Email verified : confirmed_at IS NOT NULL
 #   Phone verified : needs_phone_confirmation = false
@@ -791,12 +792,35 @@ _LOCS_TABLE      = "prod_redshift_replica.postgres.locations"
 _TIMECARDS_TABLE = "prod_redshift_replica.postgres.timecards"
 _ONBOARD_DOCS    = "prod_redshift_replica.postgres.employee_onboarding_documents"
 
-# Email domains historically associated with fraudulent / disposable accounts.
-# Sourced from the mail.com family of free-email providers + known bad-actor patterns.
 _FRAUD_DOMAINS_SQL = (
     "'mail.com', 'engineer.com', 'usa.com', 'consultant.com', 'myself.com', "
     "'dr.com', 'post.com', 'techie.com', 'writeme.com', 'cheerful.com'"
 )
+
+
+def _company_accounts_cte(company_id: int, extra_where: str = "") -> str:
+    """
+    CTE that resolves all active accounts for a company using a
+    locations → jobs → accounts join order so the company_id filter
+    runs first on the small locations table, not the large accounts table.
+    extra_where: optional additional WHERE conditions on j.* or a.*
+    """
+    return f"""
+    company_accounts AS (
+        SELECT DISTINCT
+            a.id                       AS account_id,
+            a.email,
+            a.phone,
+            a.confirmed_at,
+            a.needs_phone_confirmation,
+            j.level                    AS user_role
+        FROM {_LOCS_TABLE}     l
+        JOIN {_JOBS_TABLE}     j ON j.location_id = l.id
+        JOIN {_ACCOUNTS_TABLE} a ON a.id          = j.user_id
+        WHERE l.company_id  = {company_id}
+          AND j.archived_at IS NULL
+          {extra_where}
+    )"""
 
 
 # ---------------------------------------------------------------------------
@@ -807,21 +831,17 @@ def check_suspicious_email_domains(company_id: int) -> Dict[str, Any]:
     """
     ALERT if the owner or any employee is using an email domain
     historically associated with fraudulent or disposable accounts.
-    Domain extracted via SPLIT(email, '@')[1] (0-indexed array).
     """
     sql = f"""
+    WITH {_company_accounts_cte(company_id)}
     SELECT DISTINCT
-        a.id                                   AS user_id,
-        a.email,
-        LOWER(SPLIT(a.email, '@')[1])          AS email_domain,
-        j.level                                AS user_role
-    FROM {_ACCOUNTS_TABLE} a
-    JOIN {_JOBS_TABLE}      j ON a.id          = j.user_id
-    JOIN {_LOCS_TABLE}      l ON j.location_id = l.id
-    WHERE l.company_id = {company_id}
-      AND j.archived_at IS NULL
-      AND LOWER(SPLIT(a.email, '@')[1]) IN ({_FRAUD_DOMAINS_SQL})
-    ORDER BY user_role, a.email
+        ca.account_id                          AS user_id,
+        ca.email,
+        LOWER(SPLIT(ca.email, '@')[1])         AS email_domain,
+        ca.user_role
+    FROM company_accounts ca
+    WHERE LOWER(SPLIT(ca.email, '@')[1]) IN ({_FRAUD_DOMAINS_SQL})
+    ORDER BY ca.user_role, ca.email
     """
     try:
         df = run_query(sql)
@@ -843,27 +863,21 @@ def check_suspicious_email_domains(company_id: int) -> Dict[str, Any]:
 
 def check_owner_verification(company_id: int) -> Dict[str, Any]:
     """
-    ALERT if any manager account on this company has not verified their email or phone.
-    We check managers (j.level = 'manager') since the account owner is stored
-    at that level in Homebase's jobs table.
+    ALERT if any manager account has unverified email or phone.
     """
     sql = f"""
-    SELECT DISTINCT
-        a.id                                                                     AS account_id,
-        a.email,
-        a.phone,
-        j.level                                                                  AS user_role,
-        CASE WHEN a.confirmed_at         IS NOT NULL THEN 'Verified' ELSE 'NOT VERIFIED' END AS email_verified,
-        CASE WHEN a.needs_phone_confirmation = false  THEN 'Verified' ELSE 'NOT VERIFIED' END AS phone_verified,
-        a.confirmed_at                                                           AS email_verified_at
-    FROM {_ACCOUNTS_TABLE} a
-    JOIN {_JOBS_TABLE}      j ON a.id          = j.user_id
-    JOIN {_LOCS_TABLE}      l ON j.location_id = l.id
-    WHERE l.company_id = {company_id}
-      AND j.archived_at IS NULL
-      AND LOWER(j.level) = 'manager'
-      AND (a.confirmed_at IS NULL OR a.needs_phone_confirmation = true)
-    ORDER BY account_id
+    WITH {_company_accounts_cte(company_id, "AND LOWER(j.level) = 'manager'")}
+    SELECT
+        ca.account_id,
+        ca.email,
+        ca.phone,
+        ca.user_role,
+        CASE WHEN ca.confirmed_at          IS NOT NULL THEN 'Verified' ELSE 'NOT VERIFIED' END AS email_verified,
+        CASE WHEN ca.needs_phone_confirmation = false   THEN 'Verified' ELSE 'NOT VERIFIED' END AS phone_verified,
+        ca.confirmed_at                                                                          AS email_verified_at
+    FROM company_accounts ca
+    WHERE ca.confirmed_at IS NULL OR ca.needs_phone_confirmation = true
+    ORDER BY ca.account_id
     """
     try:
         df = run_query(sql)
@@ -889,28 +903,23 @@ def check_owner_verification(company_id: int) -> Dict[str, Any]:
 
 def check_employee_verification(company_id: int) -> Dict[str, Any]:
     """
-    ALERT if zero employee/manager accounts have verified their email or phone.
-    Excludes accounts with no email AND no phone (placeholder/shell accounts).
-    Uses 'employer' as the owner level to exclude — mirroring check_owner_verification.
+    ALERT if zero non-manager employees have verified email or phone.
+    Excludes accounts with no email AND no phone.
     """
     sql = f"""
-    SELECT DISTINCT
-        a.id                                                                     AS account_id,
-        a.email,
-        a.phone,
-        j.level                                                                  AS user_role,
-        CASE WHEN a.confirmed_at         IS NOT NULL THEN 'Verified' ELSE 'NOT VERIFIED' END AS email_verified,
-        CASE WHEN a.needs_phone_confirmation = false  THEN 'Verified' ELSE 'NOT VERIFIED' END AS phone_verified,
-        CASE WHEN a.confirmed_at IS NOT NULL OR a.needs_phone_confirmation = false
-             THEN true ELSE false END                                             AS any_verified
-    FROM {_ACCOUNTS_TABLE} a
-    JOIN {_JOBS_TABLE}      j ON a.id          = j.user_id
-    JOIN {_LOCS_TABLE}      l ON j.location_id = l.id
-    WHERE l.company_id = {company_id}
-      AND j.archived_at IS NULL
-      AND LOWER(j.level) NOT IN ('owner', 'employer')
-      AND (a.email IS NOT NULL OR a.phone IS NOT NULL)
-    ORDER BY user_role, a.email
+    WITH {_company_accounts_cte(company_id, "AND LOWER(j.level) NOT IN ('owner', 'employer', 'manager')")}
+    SELECT
+        ca.account_id,
+        ca.email,
+        ca.phone,
+        ca.user_role,
+        CASE WHEN ca.confirmed_at          IS NOT NULL THEN 'Verified' ELSE 'NOT VERIFIED' END AS email_verified,
+        CASE WHEN ca.needs_phone_confirmation = false   THEN 'Verified' ELSE 'NOT VERIFIED' END AS phone_verified,
+        CASE WHEN ca.confirmed_at IS NOT NULL OR ca.needs_phone_confirmation = false
+             THEN true ELSE false END                                                            AS any_verified
+    FROM company_accounts ca
+    WHERE ca.email IS NOT NULL OR ca.phone IS NOT NULL
+    ORDER BY ca.user_role, ca.email
     """
     try:
         df = run_query(sql)
@@ -919,10 +928,11 @@ def check_employee_verification(company_id: int) -> Dict[str, Any]:
         total    = len(df)
         verified = int(df["any_verified"].sum()) if "any_verified" in df.columns else 0
         flagged  = verified == 0
-        if flagged:
-            msg = f"No employees have verified their email or phone ({total} account{'s' if total != 1 else ''} checked)"
-        else:
-            msg = f"{verified} of {total} employee account{'s' if total != 1 else ''} have verified contact details"
+        msg = (
+            f"No employees have verified their email or phone ({total} account{'s' if total != 1 else ''} checked)"
+            if flagged else
+            f"{verified} of {total} employee account{'s' if total != 1 else ''} have verified contact details"
+        )
         return _result("ALERT" if flagged else "CLEAR", msg, df, verified)
     except Exception as exc:
         return _error(exc)
@@ -1039,10 +1049,10 @@ def check_payment_method_on_file(company_id: int) -> Dict[str, Any]:
     sql = f"""
     WITH manager_emails AS (
         SELECT DISTINCT a.email
-        FROM {_ACCOUNTS_TABLE} a
-        JOIN {_JOBS_TABLE}     j ON a.id          = j.user_id
-        JOIN {_LOCS_TABLE}     l ON j.location_id = l.id
-        WHERE l.company_id = {company_id}
+        FROM {_LOCS_TABLE}     l
+        JOIN {_JOBS_TABLE}     j ON j.location_id = l.id
+        JOIN {_ACCOUNTS_TABLE} a ON a.id          = j.user_id
+        WHERE l.company_id  = {company_id}
           AND j.archived_at IS NULL
           AND LOWER(j.level) = 'manager'
           AND a.email IS NOT NULL
