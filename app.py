@@ -344,7 +344,16 @@ def main():
     with ThreadPoolExecutor(max_workers=5) as pool:
         futures = {pool.submit(_run, item): item[0] for item in SIGNAL_FNS.items()}
         for future in as_completed(futures):
-            key, result = future.result()
+            key = futures[future]
+            try:
+                key, result = future.result(timeout=45)
+            except Exception as exc:
+                result = {
+                    "status":      "ERROR",
+                    "message":     f"Signal timed out or failed: {exc}",
+                    "detail_df":   pd.DataFrame(),
+                    "alert_count": 0,
+                }
             results[key] = result
             completed += 1
             progress.progress(
