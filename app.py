@@ -323,27 +323,36 @@ def main():
     }
 
     results: dict[str, dict] = {}
+    total    = len(SIGNAL_FNS)
+    progress = st.progress(0, text="Starting signal checks…")
 
-    with st.spinner("Running fraud signal checks…"):
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        def _run(key_fn):
-            key, fn = key_fn
-            try:
-                return key, fn(company_id)
-            except Exception as exc:
-                return key, {
-                    "status":      "ERROR",
-                    "message":     str(exc),
-                    "detail_df":   pd.DataFrame(),
-                    "alert_count": 0,
-                }
+    def _run(key_fn):
+        key, fn = key_fn
+        try:
+            return key, fn(company_id)
+        except Exception as exc:
+            return key, {
+                "status":      "ERROR",
+                "message":     str(exc),
+                "detail_df":   pd.DataFrame(),
+                "alert_count": 0,
+            }
 
-        with ThreadPoolExecutor(max_workers=len(SIGNAL_FNS)) as pool:
-            futures = {pool.submit(_run, item): item[0] for item in SIGNAL_FNS.items()}
-            for future in as_completed(futures):
-                key, result = future.result()
-                results[key] = result
+    completed = 0
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {pool.submit(_run, item): item[0] for item in SIGNAL_FNS.items()}
+        for future in as_completed(futures):
+            key, result = future.result()
+            results[key] = result
+            completed += 1
+            progress.progress(
+                completed / total,
+                text=f"Checking signals… {completed} of {total} done",
+            )
+
+    progress.empty()
 
     # ── Risk score summary ───────────────────────────────────────────────────
     implemented_results = {k: v for k, v in results.items() if v["status"] != "PENDING"}
