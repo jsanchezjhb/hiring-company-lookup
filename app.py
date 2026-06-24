@@ -506,6 +506,17 @@ def main():
                 "alert_count": 0,
             }
 
+    def _render_card(key: str, result: dict) -> None:
+        """Update the placeholder for a single signal key."""
+        ph, sig = card_placeholders[key]
+        with ph.container():
+            signal_card(
+                icon=sig["icon"],
+                title=sig["title"],
+                description=sig["description"],
+                result=result,
+            )
+
     # ── Phase 1: render summary placeholder + section headers + card placeholders ──
     summary_ph = st.empty()
     summary_ph.info("⏳ Analysis in progress…")
@@ -526,35 +537,36 @@ def main():
                 ):
                     st.caption("Running signal check…")
 
-    # ── Phase 2: run signals, update each card as its result arrives ──
+    # ── Phase 2: warm up the warehouse, then run signals in parallel ──
     TOTAL_TIMEOUT = 90
 
-    with ThreadPoolExecutor(max_workers=5) as pool:
+    # Warm-up: open one connection first so the warehouse is awake before
+    # parallel threads compete for it — prevents cold-start timeouts.
+    try:
+        run_query("SELECT 1")
+    except Exception:
+        pass  # if warm-up fails, proceed anyway
+
+    # Use manual pool management with shutdown(wait=False) so that if the
+    # timeout fires, hanging threads are abandoned and the page renders
+    # immediately rather than blocking on __exit__(shutdown(wait=True)).
+    pool = ThreadPoolExecutor(max_workers=5)
+    try:
         futures_map = {pool.submit(_run, item): item[0] for item in SIGNAL_FNS.items()}
         try:
             for future in as_completed(futures_map, timeout=TOTAL_TIMEOUT):
                 key, result = future.result()
                 results[key] = result
-                ph, sig = card_placeholders[key]
-                with ph.container():
-                    signal_card(
-                        icon=sig["icon"],
-                        title=sig["title"],
-                        description=sig["description"],
-                        result=result,
-                    )
+                _render_card(key, result)
         except FuturesTimeoutError:
-            timed_out_keys = [k for k in SIGNAL_FNS if results[k] is _timed_out_result or
-                              results[k].get("message", "").startswith("Query timed out")]
-            for key in timed_out_keys:
-                ph, sig = card_placeholders[key]
-                with ph.container():
-                    signal_card(
-                        icon=sig["icon"],
-                        title=sig["title"],
-                        description=sig["description"],
-                        result=results[key],
-                    )
+            pass  # timed-out keys are already pre-populated; render them below
+    finally:
+        pool.shutdown(wait=False)  # abandon any still-hanging threads immediately
+
+    # Render any cards that never completed (timed out or errored before rendering)
+    for key in SIGNAL_FNS:
+        if results[key].get("message", "").startswith("Query timed out"):
+            _render_card(key, results[key])
 
     # ── Phase 3: update summary with final risk score ──
     implemented_results = {k: v for k, v in results.items() if v["status"] != "PENDING"}
