@@ -325,16 +325,25 @@ def main():
     results: dict[str, dict] = {}
 
     with st.spinner("Running fraud signal checks…"):
-        for key, fn in SIGNAL_FNS.items():
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _run(key_fn):
+            key, fn = key_fn
             try:
-                results[key] = fn(company_id)
+                return key, fn(company_id)
             except Exception as exc:
-                results[key] = {
+                return key, {
                     "status":      "ERROR",
                     "message":     str(exc),
                     "detail_df":   pd.DataFrame(),
                     "alert_count": 0,
                 }
+
+        with ThreadPoolExecutor(max_workers=len(SIGNAL_FNS)) as pool:
+            futures = {pool.submit(_run, item): item[0] for item in SIGNAL_FNS.items()}
+            for future in as_completed(futures):
+                key, result = future.result()
+                results[key] = result
 
     # ── Risk score summary ───────────────────────────────────────────────────
     implemented_results = {k: v for k, v in results.items() if v["status"] != "PENDING"}
