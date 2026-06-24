@@ -717,7 +717,9 @@ def check_fingerprint_reuse(company_id: int) -> Dict[str, Any]:
     ALERT if a card fingerprint on this company's charges also appears on
     charges from other companies — strong indicator of fraud ring activity.
     Fingerprint extracted from: GET_JSON_OBJECT(payment_method_details, '$.card.fingerprint')
+    Cross-company scan is limited to the last 2 years to avoid a full table scan.
     """
+    two_years_ago_epoch = "UNIX_TIMESTAMP() - 63072000"
     sql = f"""
     WITH {_company_customers_cte(company_id)},
     target_fps AS (
@@ -733,14 +735,15 @@ def check_fingerprint_reuse(company_id: int) -> Dict[str, Any]:
         SELECT
             GET_JSON_OBJECT(c.payment_method_details, {_FINGERPRINT_PATH}) AS fingerprint,
             CAST(GET_JSON_OBJECT(s.metadata, '$.company_id') AS INT)        AS other_company_id,
-            MIN(FROM_UNIXTIME(c.created))                                    AS first_seen_at
+            MIN(FROM_UNIXTIME(c.created))                                   AS first_seen_at
         FROM {_CHG_TABLE} c
-        INNER JOIN {_SUB_TABLE} s ON s.customer = c.customer
-        INNER JOIN target_fps tf
-          ON tf.fingerprint = GET_JSON_OBJECT(c.payment_method_details, {_FINGERPRINT_PATH})
+        INNER JOIN {_SUB_TABLE} s  ON s.customer = c.customer
+        INNER JOIN target_fps   tf ON tf.fingerprint
+                                    = GET_JSON_OBJECT(c.payment_method_details, {_FINGERPRINT_PATH})
         WHERE GET_JSON_OBJECT(s.metadata, '$.company_id') != '{company_id}'
           AND GET_JSON_OBJECT(s.metadata, '$.company_id') IS NOT NULL
           AND GET_JSON_OBJECT(c.payment_method_details, {_FINGERPRINT_PATH}) IS NOT NULL
+          AND c.created >= {two_years_ago_epoch}
         GROUP BY
             GET_JSON_OBJECT(c.payment_method_details, {_FINGERPRINT_PATH}),
             GET_JSON_OBJECT(s.metadata, '$.company_id')
@@ -748,13 +751,14 @@ def check_fingerprint_reuse(company_id: int) -> Dict[str, Any]:
     SELECT
         om.fingerprint,
         om.other_company_id,
-        co.name                          AS other_company_name,
-        om.first_seen_at                 AS first_seen_at_other_account,
+        co.name                         AS other_company_name,
+        om.first_seen_at                AS first_seen_at_other_account,
         tf.first_used_on_this_account
     FROM other_matches om
     INNER JOIN target_fps tf ON tf.fingerprint = om.fingerprint
-    LEFT JOIN {_CO_TABLE} co ON co.company_id = om.other_company_id
+    LEFT JOIN {_CO_TABLE} co ON co.company_id  = om.other_company_id
     ORDER BY om.first_seen_at DESC
+    LIMIT 100
     """
     try:
         df         = run_query(sql)
@@ -930,19 +934,23 @@ def check_employee_verification(company_id: int) -> Dict[str, Any]:
 
 def check_suspicious_timecards(company_id: int) -> Dict[str, Any]:
     """
-    ALERT if a manager entered more than 3 timecard punches (clock_in_source = 'manager')
-    within the most recent pay period (last 14 days as proxy).
-
-    Employees are expected to clock themselves in/out. A manager entering punches
-    is an override — rare and legitimate in isolation, but more than 3 in a single
-    pay period is suspicious and may indicate fabricated records.
+    ALERT if a manager entered more than 3 timecard punches in the last 14 days.
+    Query filters company → locations → jobs first (small sets) before touching
+    the large timecards table, avoiding a full table scan.
     """
     THRESHOLD = 3
     sql = f"""
+    WITH company_jobs AS (
+        SELECT j.id AS job_id, j.user_id, j.level
+        FROM {_JOBS_TABLE}  j
+        JOIN {_LOCS_TABLE}  l ON j.location_id = l.id
+        WHERE l.company_id  = {company_id}
+          AND j.archived_at IS NULL
+    )
     SELECT
         tc.id                       AS timecard_id,
-        j.user_id,
-        j.level                     AS user_role,
+        cj.user_id,
+        cj.level                    AS user_role,
         tc.start_at,
         tc.end_at,
         tc.clock_in_source,
@@ -952,15 +960,13 @@ def check_suspicious_timecards(company_id: int) -> Dict[str, Any]:
         HOUR(tc.start_at)           AS start_hour,
         HOUR(tc.end_at)             AS end_hour
     FROM {_TIMECARDS_TABLE} tc
-    JOIN {_JOBS_TABLE}       j  ON tc.job_id      = j.id
-    JOIN {_LOCS_TABLE}       l  ON j.location_id  = l.id
-    WHERE l.company_id = {company_id}
-      AND j.archived_at IS NULL
-      AND tc.clock_in_source = 'manager'
-      AND tc.start_at >= DATE_SUB(CURRENT_DATE(), 14)
+    JOIN company_jobs cj ON tc.job_id = cj.job_id
+    WHERE tc.clock_in_source = 'manager'
+      AND tc.start_at >= CURRENT_DATE - INTERVAL 14 DAYS
       AND tc.start_at IS NOT NULL
       AND tc.end_at   IS NOT NULL
     ORDER BY tc.start_at DESC
+    LIMIT 100
     """
     try:
         df = run_query(sql)
