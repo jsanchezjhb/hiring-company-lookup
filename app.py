@@ -588,8 +588,11 @@ def main():
         icon="💤",
         title="Dormancy Reactivation — 30+ Day Gap",
         description=(
-            "Flags when a company resumes posting after 30+ days of no activity. "
-            "May indicate account takeover, a reactivated fraud ring, or bot behaviour."
+            "Checks whether the company had 30+ days of zero sign-in activity before "
+            "their first Hiring job post. Uses the most recent sign-in across all company "
+            "accounts vs the earliest activated job post. Also ALERTs if no sign-ins "
+            "are found at all before the first post — indicating a brand new or dormant "
+            "account jumping straight to Hiring."
         ),
         result=results["dormancy"],
     )
