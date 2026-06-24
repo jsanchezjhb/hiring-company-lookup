@@ -1210,3 +1210,112 @@ def check_payment_method_on_file(company_id: int) -> Dict[str, Any]:
             return _result("ALERT", msg, df, 0)
     except Exception as exc:
         return _error(exc)
+
+# ---------------------------------------------------------------------------
+# Signal 16 — Owner / Manager Linked to Other Companies
+# ---------------------------------------------------------------------------
+
+def check_owner_multi_company(company_id: int) -> Dict[str, Any]:
+    """
+    ALERT if the manager account(s) on this company also appear at other companies,
+    either as the same Homebase account or via a matching email / phone on a
+    different account. Any role at another company (owner, manager, employee)
+    is flagged — this is not a dealbreaker but warrants investigation.
+
+    Three match paths:
+      same_account — same account_id linked to a job at a different company
+      email_match  — different account ID but identical email address
+      phone_match  — different account ID but identical phone number
+    """
+    sql = f"""
+    WITH company_managers AS (
+        SELECT DISTINCT a.id AS account_id, a.email, a.phone
+        FROM {_LOCS_TABLE}     l
+        JOIN {_JOBS_TABLE}     j ON j.location_id = l.id
+        JOIN {_ACCOUNTS_TABLE} a ON a.id          = j.user_id
+        WHERE l.company_id  = {company_id}
+          AND LOWER(j.level) = 'manager'
+          AND j.archived_at  IS NULL
+    ),
+    other_appearances AS (
+        -- Same account ID linked to a job at a different company
+        SELECT DISTINCT
+            cm.account_id,
+            cm.email,
+            cm.phone,
+            LOWER(j.level)  AS role_at_other_company,
+            l.company_id    AS other_company_id,
+            'same_account'  AS match_type
+        FROM company_managers cm
+        JOIN {_JOBS_TABLE}  j ON j.user_id     = cm.account_id
+        JOIN {_LOCS_TABLE}  l ON j.location_id = l.id
+        WHERE l.company_id != {company_id}
+          AND j.archived_at IS NULL
+
+        UNION
+
+        -- Different account, matching email
+        SELECT DISTINCT
+            a.id            AS account_id,
+            a.email,
+            a.phone,
+            LOWER(j.level)  AS role_at_other_company,
+            l.company_id    AS other_company_id,
+            'email_match'   AS match_type
+        FROM {_ACCOUNTS_TABLE} a
+        JOIN {_JOBS_TABLE}  j ON j.user_id     = a.id
+        JOIN {_LOCS_TABLE}  l ON j.location_id = l.id
+        WHERE a.email IS NOT NULL
+          AND a.email IN (SELECT email FROM company_managers WHERE email IS NOT NULL)
+          AND a.id    NOT IN (SELECT account_id FROM company_managers)
+          AND l.company_id != {company_id}
+          AND j.archived_at IS NULL
+
+        UNION
+
+        -- Different account, matching phone
+        SELECT DISTINCT
+            a.id            AS account_id,
+            a.email,
+            a.phone,
+            LOWER(j.level)  AS role_at_other_company,
+            l.company_id    AS other_company_id,
+            'phone_match'   AS match_type
+        FROM {_ACCOUNTS_TABLE} a
+        JOIN {_JOBS_TABLE}  j ON j.user_id     = a.id
+        JOIN {_LOCS_TABLE}  l ON j.location_id = l.id
+        WHERE a.phone IS NOT NULL
+          AND a.phone IN (SELECT phone FROM company_managers WHERE phone IS NOT NULL)
+          AND a.id    NOT IN (SELECT account_id FROM company_managers)
+          AND l.company_id != {company_id}
+          AND j.archived_at IS NULL
+    )
+    SELECT
+        oa.account_id,
+        oa.email,
+        oa.phone,
+        oa.role_at_other_company,
+        oa.other_company_id,
+        c.name          AS other_company_name,
+        oa.match_type
+    FROM other_appearances oa
+    LEFT JOIN {_CO_TABLE} c ON c.company_id = oa.other_company_id
+    ORDER BY oa.other_company_id, oa.role_at_other_company
+    LIMIT 100
+    """
+    try:
+        df    = run_query(sql)
+        count = len(df)
+        flagged = count > 0
+        if flagged:
+            n_companies = df["other_company_id"].nunique() if "other_company_id" in df.columns else count
+            msg = (
+                f"Manager linked to {n_companies} other "
+                f"{'companies' if n_companies != 1 else 'company'} "
+                f"({count} role{'s' if count != 1 else ''} found)"
+            )
+        else:
+            msg = "Manager accounts are not linked to any other companies"
+        return _result("ALERT" if flagged else "CLEAR", msg, df, count)
+    except Exception as exc:
+        return _error(exc)
