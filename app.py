@@ -305,24 +305,184 @@ def main():
     st.markdown("### 🛡️ Fraud Signal Analysis")
 
     SIGNAL_FNS = {
-        "active_jobs":          check_active_job_posts,
-        "rapid_postings":       check_rapid_postings,
-        "hourly_burst":         check_hourly_burst,
-        "ip_mismatch":          check_ip_location_mismatch,
-        "dormancy":             check_dormancy_reactivation,
-        "failed_billing":       check_failed_billing,
-        "disputes":             check_billing_disputes,
-        "pm_changes":           check_payment_method_changes,
-        "fingerprint_reuse":    check_fingerprint_reuse,
-        "suspicious_domains":   check_suspicious_email_domains,
-        "owner_verification":   check_owner_verification,
+        "active_jobs":           check_active_job_posts,
+        "rapid_postings":        check_rapid_postings,
+        "hourly_burst":          check_hourly_burst,
+        "ip_mismatch":           check_ip_location_mismatch,
+        "dormancy":              check_dormancy_reactivation,
+        "failed_billing":        check_failed_billing,
+        "disputes":              check_billing_disputes,
+        "pm_changes":            check_payment_method_changes,
+        "fingerprint_reuse":     check_fingerprint_reuse,
+        "suspicious_domains":    check_suspicious_email_domains,
+        "owner_verification":    check_owner_verification,
         "employee_verification": check_employee_verification,
-        "suspicious_timecards": check_suspicious_timecards,
-        "employee_documents":   check_employee_documents,
-        "payment_method":       check_payment_method_on_file,
+        "suspicious_timecards":  check_suspicious_timecards,
+        "employee_documents":    check_employee_documents,
+        "payment_method":        check_payment_method_on_file,
     }
 
-    # Pre-populate every key so rendering never hits a KeyError even if signals time out
+    # Section layout — defines display order and all card metadata
+    SECTIONS = [
+        {
+            "label": "🌐 Account & Identity",
+            "signals": [
+                {
+                    "key": "ip_mismatch", "icon": "🌐",
+                    "title": "IP / Location Mismatch",
+                    "description": (
+                        "Compares the IP address at account creation against the company's registered city and state. "
+                        "Returns all rows — City Match, State Match Only, and No Match — so you can see the full picture. "
+                        "ALERTs on any 'No Match' result. "
+                        "The mismatch_pct column shows the heuristic fraud likelihood "
+                        "(e.g. known CDN cities like Ashburn score lower than a foreign-country IP)."
+                    ),
+                },
+            ],
+        },
+        {
+            "label": "👤 Account & Employee Risk",
+            "signals": [
+                {
+                    "key": "suspicious_domains", "icon": "📧",
+                    "title": "Suspicious Email Domains",
+                    "description": (
+                        "Checks whether the owner or any employee account is using an email domain "
+                        "historically associated with fraudulent or disposable registrations "
+                        "(e.g. mail.com, engineer.com, usa.com). "
+                        "Flags all matching accounts with their role and domain."
+                    ),
+                },
+                {
+                    "key": "owner_verification", "icon": "👤",
+                    "title": "Manager Email / Phone Verification",
+                    "description": (
+                        "Checks whether all manager accounts on this company have verified their email "
+                        "address (confirmed_at) and phone number (needs_phone_confirmation). "
+                        "An unverified manager on a new account is a strong identity risk signal."
+                    ),
+                },
+                {
+                    "key": "employee_verification", "icon": "👥",
+                    "title": "Employee Email / Phone Verification",
+                    "description": (
+                        "Flags any employee or manager account linked to this company that has not verified "
+                        "their email or phone. A high proportion of unverified employees on a new account "
+                        "may indicate bulk fake account creation."
+                    ),
+                },
+                {
+                    "key": "suspicious_timecards", "icon": "🕐",
+                    "title": "Suspicious Manager Timecard Overrides",
+                    "description": (
+                        "Flags when a manager entered more than 3 timecard punches in the last 14 days "
+                        "(proxy for one pay period). Employees are expected to clock themselves in — "
+                        "a manager override is an exception. More than 3 in a pay period may indicate "
+                        "fabricated or adjusted records."
+                    ),
+                },
+                {
+                    "key": "employee_documents", "icon": "📁",
+                    "title": "Employee Onboarding Documents",
+                    "description": (
+                        "Flags when onboarding documents are already uploaded for a new company. "
+                        "Pre-uploaded documents on a brand-new account may be forged or "
+                        "uploaded to falsely establish legitimacy — worth verifying."
+                    ),
+                },
+            ],
+        },
+        {
+            "label": "💳 Billing & Payments",
+            "signals": [
+                {
+                    "key": "payment_method", "icon": "💰",
+                    "title": "Payment Method on File",
+                    "description": (
+                        "Checks whether this company has a Stripe customer record with charges on file. "
+                        "A new company using a paid Hiring feature with no payment method configured "
+                        "is a potential fraud signal — they may not intend to pay."
+                    ),
+                },
+                {
+                    "key": "failed_billing", "icon": "💳",
+                    "title": "Failed Billing Attempts",
+                    "description": (
+                        "Flags companies with one or more unsuccessful billing attempts from Stripe. "
+                        "Repeated failures may indicate stolen or invalid card details."
+                    ),
+                },
+                {
+                    "key": "disputes", "icon": "⚖️",
+                    "title": "Billing Disputes",
+                    "description": (
+                        "Flags companies with any billing disputes. "
+                        "Chargebacks can indicate fraudulent account creation."
+                    ),
+                },
+                {
+                    "key": "pm_changes", "icon": "🔄",
+                    "title": "Excessive Payment Method Changes",
+                    "description": (
+                        "Flags companies that have changed their payment method more than 2 times. "
+                        "High turnover may indicate card-testing behaviour."
+                    ),
+                },
+                {
+                    "key": "fingerprint_reuse", "icon": "🫂",
+                    "title": "Stripe Fingerprint Reuse Across Accounts",
+                    "description": (
+                        "Flags when this company's Stripe card fingerprint also appears on one or more "
+                        "other company accounts. The same physical card being used across separate accounts "
+                        "is a strong indicator of a fraud ring or bulk account creation. "
+                        "Stripe fingerprints are stable even when a card is re-issued with a new expiry date."
+                    ),
+                },
+            ],
+        },
+        {
+            "label": "📌 Job Posting Behaviour",
+            "signals": [
+                {
+                    "key": "active_jobs", "icon": "📋",
+                    "title": "Active Job Posts",
+                    "description": (
+                        "Flags companies with 10 or more currently active job postings. "
+                        "Legitimate businesses rarely maintain this many simultaneous open roles."
+                    ),
+                },
+                {
+                    "key": "rapid_postings", "icon": "⚡",
+                    "title": "Rapid Posting — Under 1 Minute Apart",
+                    "description": (
+                        "Flags any two consecutive job posts created less than 60 seconds apart. "
+                        "This pattern is consistent with automated or bulk fraudulent submission."
+                    ),
+                },
+                {
+                    "key": "hourly_burst", "icon": "📈",
+                    "title": "Hourly Posting Burst — 4+ Jobs in One Hour",
+                    "description": (
+                        "Flags when 4 or more jobs were posted within the same clock hour. "
+                        "Expands to show every job in the flagged window."
+                    ),
+                },
+                {
+                    "key": "dormancy", "icon": "💤",
+                    "title": "Dormancy Reactivation — 30+ Day Gap",
+                    "description": (
+                        "Checks whether the company had 30+ days of zero sign-in activity before "
+                        "their first Hiring job post. Uses the most recent sign-in across all company "
+                        "accounts vs the earliest activated job post. Also ALERTs if no sign-ins "
+                        "are found at all before the first post — indicating a brand new or dormant "
+                        "account jumping straight to Hiring."
+                    ),
+                },
+            ],
+        },
+    ]
+
+    # Pre-populate every key so rendering never hits a KeyError if signals time out
     _timed_out_result = {
         "status":      "ERROR",
         "message":     "Query timed out — signal did not complete",
@@ -330,9 +490,6 @@ def main():
         "alert_count": 0,
     }
     results: dict[str, dict] = {key: _timed_out_result.copy() for key in SIGNAL_FNS}
-
-    total    = len(SIGNAL_FNS)
-    progress = st.progress(0, text="Starting signal checks…")
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from concurrent.futures import TimeoutError as FuturesTimeoutError
@@ -349,29 +506,57 @@ def main():
                 "alert_count": 0,
             }
 
-    TOTAL_TIMEOUT = 90  # seconds before any still-running signal is abandoned
+    # ── Phase 1: render summary placeholder + section headers + card placeholders ──
+    summary_ph = st.empty()
+    summary_ph.info("⏳ Analysis in progress…")
 
-    completed = 0
+    card_placeholders: dict[str, tuple] = {}
+    for section in SECTIONS:
+        st.markdown(
+            f"<div class='section-label'>{section['label']}</div>",
+            unsafe_allow_html=True,
+        )
+        for sig in section["signals"]:
+            ph = st.empty()
+            card_placeholders[sig["key"]] = (ph, sig)
+            with ph.container():
+                with st.expander(
+                    f"{sig['icon']} {sig['title']} — ⏳ checking…",
+                    expanded=False,
+                ):
+                    st.caption("Running signal check…")
+
+    # ── Phase 2: run signals, update each card as its result arrives ──
+    TOTAL_TIMEOUT = 90
+
     with ThreadPoolExecutor(max_workers=5) as pool:
         futures_map = {pool.submit(_run, item): item[0] for item in SIGNAL_FNS.items()}
         try:
             for future in as_completed(futures_map, timeout=TOTAL_TIMEOUT):
                 key, result = future.result()
                 results[key] = result
-                completed += 1
-                progress.progress(
-                    completed / total,
-                    text=f"Checking signals… {completed} of {total} done",
-                )
+                ph, sig = card_placeholders[key]
+                with ph.container():
+                    signal_card(
+                        icon=sig["icon"],
+                        title=sig["title"],
+                        description=sig["description"],
+                        result=result,
+                    )
         except FuturesTimeoutError:
-            # Results for timed-out signals are already pre-populated above —
-            # just fill the progress bar and show which ones didn't finish
-            timed_out = [key for key in SIGNAL_FNS if results[key]["message"].startswith("Query timed out")]
-            progress.progress(1.0, text=f"Done — {len(timed_out)} signal(s) timed out: {', '.join(timed_out)}")
+            timed_out_keys = [k for k in SIGNAL_FNS if results[k] is _timed_out_result or
+                              results[k].get("message", "").startswith("Query timed out")]
+            for key in timed_out_keys:
+                ph, sig = card_placeholders[key]
+                with ph.container():
+                    signal_card(
+                        icon=sig["icon"],
+                        title=sig["title"],
+                        description=sig["description"],
+                        result=results[key],
+                    )
 
-    progress.empty()
-
-    # ── Risk score summary ───────────────────────────────────────────────────
+    # ── Phase 3: update summary with final risk score ──
     implemented_results = {k: v for k, v in results.items() if v["status"] != "PENDING"}
     alerts   = sum(1 for v in implemented_results.values() if v["status"] == "ALERT")
     analyzed = len(implemented_results)
@@ -384,7 +569,7 @@ def main():
     else:
         risk_level, risk_css, risk_emoji = "LOW",    "risk-low",    "🟢"
 
-    st.markdown(
+    summary_ph.markdown(
         f"""
         <div class="{risk_css}" style="margin-bottom:20px;">
             <span style="font-size:22px;font-weight:800;">{risk_emoji} Risk Level: {risk_level}</span>
@@ -397,204 +582,6 @@ def main():
         </div>
         """,
         unsafe_allow_html=True,
-    )
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Signal cards — Account & Identity
-    # ─────────────────────────────────────────────────────────────────────────
-    st.markdown(
-        "<div class='section-label'>🌐 Account & Identity</div>",
-        unsafe_allow_html=True,
-    )
-
-    signal_card(
-        icon="🌐",
-        title="IP / Location Mismatch",
-        description=(
-            "Compares the IP address at account creation against the company's registered city and state. "
-            "Returns all rows — City Match, State Match Only, and No Match — so you can see the full picture. "
-            "ALERTs on any 'No Match' result. "
-            "The mismatch_pct column shows the heuristic fraud likelihood "
-            "(e.g. known CDN cities like Ashburn score lower than a foreign-country IP)."
-        ),
-        result=results["ip_mismatch"],
-    )
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Signal cards — Account & Employee Risk
-    # ─────────────────────────────────────────────────────────────────────────
-    st.markdown(
-        "<div class='section-label'>👤 Account & Employee Risk</div>",
-        unsafe_allow_html=True,
-    )
-
-    signal_card(
-        icon="📧",
-        title="Suspicious Email Domains",
-        description=(
-            "Checks whether the owner or any employee account is using an email domain "
-            "historically associated with fraudulent or disposable registrations "
-            "(e.g. mail.com, engineer.com, usa.com). "
-            "Flags all matching accounts with their role and domain."
-        ),
-        result=results["suspicious_domains"],
-    )
-
-    signal_card(
-        icon="👤",
-        title="Manager Email / Phone Verification",
-        description=(
-            "Checks whether all manager accounts on this company have verified their email "
-            "address (confirmed_at) and phone number (needs_phone_confirmation). "
-            "An unverified manager on a new account is a strong identity risk signal."
-        ),
-        result=results["owner_verification"],
-    )
-
-    signal_card(
-        icon="👥",
-        title="Employee Email / Phone Verification",
-        description=(
-            "Flags any employee or manager account linked to this company that has not verified "
-            "their email or phone. A high proportion of unverified employees on a new account "
-            "may indicate bulk fake account creation."
-        ),
-        result=results["employee_verification"],
-    )
-
-    signal_card(
-        icon="🕐",
-        title="Suspicious Manager Timecard Overrides",
-        description=(
-            "Flags when a manager entered more than 3 timecard punches in the last 14 days "
-            "(proxy for one pay period). Employees are expected to clock themselves in — "
-            "a manager override is an exception. More than 3 in a pay period may indicate "
-            "fabricated or adjusted records."
-        ),
-        result=results["suspicious_timecards"],
-    )
-
-    signal_card(
-        icon="📁",
-        title="Employee Onboarding Documents",
-        description=(
-            "Flags when onboarding documents are already uploaded for a new company. "
-            "Pre-uploaded documents on a brand-new account may be forged or "
-            "uploaded to falsely establish legitimacy — worth verifying."
-        ),
-        result=results["employee_documents"],
-    )
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Signal cards — Billing & Payments
-    # ─────────────────────────────────────────────────────────────────────────
-    st.markdown(
-        "<div class='section-label'>💳 Billing & Payments</div>",
-        unsafe_allow_html=True,
-    )
-
-    signal_card(
-        icon="💰",
-        title="Payment Method on File",
-        description=(
-            "Checks whether this company has a Stripe customer record with charges on file. "
-            "A new company using a paid Hiring feature with no payment method configured "
-            "is a potential fraud signal — they may not intend to pay."
-        ),
-        result=results["payment_method"],
-    )
-
-    signal_card(
-        icon="💳",
-        title="Failed Billing Attempts",
-        description=(
-            "Flags companies with one or more unsuccessful billing attempts from Stripe. "
-            "Repeated failures may indicate stolen or invalid card details."
-        ),
-        result=results["failed_billing"],
-    )
-
-    signal_card(
-        icon="⚖️",
-        title="Billing Disputes",
-        description=(
-            "Flags companies with any open or resolved billing disputes. "
-            "Chargebacks can indicate fraudulent account creation."
-        ),
-        result=results["disputes"],
-    )
-
-    signal_card(
-        icon="🔄",
-        title="Excessive Payment Method Changes",
-        description=(
-            "Flags companies that have changed their payment method more than 2 times. "
-            "High turnover may indicate card-testing behaviour."
-        ),
-        result=results["pm_changes"],
-    )
-
-    signal_card(
-        icon="🫂",
-        title="Stripe Fingerprint Reuse Across Accounts",
-        description=(
-            "Flags when this company's Stripe card fingerprint also appears on one or more "
-            "other company accounts. The same physical card being used across separate accounts "
-            "is a strong indicator of a fraud ring or bulk account creation. "
-            "Stripe fingerprints are stable even when a card is re-issued with a new expiry date."
-        ),
-        result=results["fingerprint_reuse"],
-    )
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Signal cards — Job Posting Behaviour
-    # ─────────────────────────────────────────────────────────────────────────
-    st.markdown(
-        "<div class='section-label'>📌 Job Posting Behaviour</div>",
-        unsafe_allow_html=True,
-    )
-
-    signal_card(
-        icon="📋",
-        title="Active Job Posts",
-        description=(
-            "Flags companies with 10 or more currently active job postings. "
-            "Legitimate businesses rarely maintain this many simultaneous open roles."
-        ),
-        result=results["active_jobs"],
-    )
-
-    signal_card(
-        icon="⚡",
-        title="Rapid Posting — Under 1 Minute Apart",
-        description=(
-            "Flags any two consecutive job posts created less than 60 seconds apart. "
-            "This pattern is consistent with automated or bulk fraudulent submission."
-        ),
-        result=results["rapid_postings"],
-    )
-
-    signal_card(
-        icon="📈",
-        title="Hourly Posting Burst — 4+ Jobs in One Hour",
-        description=(
-            "Flags when 4 or more jobs were posted within the same clock hour. "
-            "Expands to show every job in the flagged window."
-        ),
-        result=results["hourly_burst"],
-    )
-
-    signal_card(
-        icon="💤",
-        title="Dormancy Reactivation — 30+ Day Gap",
-        description=(
-            "Checks whether the company had 30+ days of zero sign-in activity before "
-            "their first Hiring job post. Uses the most recent sign-in across all company "
-            "accounts vs the earliest activated job post. Also ALERTs if no sign-ins "
-            "are found at all before the first post — indicating a brand new or dormant "
-            "account jumping straight to Hiring."
-        ),
-        result=results["dormancy"],
     )
 
     # ── Footer ───────────────────────────────────────────────────────────────
