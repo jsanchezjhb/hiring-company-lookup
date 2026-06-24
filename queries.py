@@ -469,10 +469,25 @@ def check_ip_location_mismatch(company_id: int) -> Dict[str, Any]:
         df = run_query(sql)
 
         if df.empty:
+            # No geo data — look up how the company was created as context
+            try:
+                co_df = run_query(f"""
+                    SELECT onboard_source
+                    FROM {_CO_TABLE}
+                    WHERE company_id = {company_id}
+                    LIMIT 1
+                """)
+                onboard = (
+                    co_df["onboard_source"].iloc[0]
+                    if not co_df.empty and co_df["onboard_source"].iloc[0] not in (None, "", "None")
+                    else "unknown"
+                )
+            except Exception:
+                onboard = "unknown"
             return _result(
                 "CLEAR",
-                "No signup geo data found for this company",
-                df,
+                f"No signup geo data found — company onboard source: {onboard}",
+                pd.DataFrame(),
                 0,
             )
 
