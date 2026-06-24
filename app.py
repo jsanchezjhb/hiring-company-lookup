@@ -322,11 +322,20 @@ def main():
         "payment_method":       check_payment_method_on_file,
     }
 
-    results: dict[str, dict] = {}
+    # Pre-populate every key so rendering never hits a KeyError even if signals time out
+    _timed_out_result = {
+        "status":      "ERROR",
+        "message":     "Query timed out — signal did not complete",
+        "detail_df":   pd.DataFrame(),
+        "alert_count": 0,
+    }
+    results: dict[str, dict] = {key: _timed_out_result.copy() for key in SIGNAL_FNS}
+
     total    = len(SIGNAL_FNS)
     progress = st.progress(0, text="Starting signal checks…")
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import TimeoutError as FuturesTimeoutError
 
     def _run(key_fn):
         key, fn = key_fn
@@ -340,10 +349,7 @@ def main():
                 "alert_count": 0,
             }
 
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    from concurrent.futures import TimeoutError as FuturesTimeoutError
-
-    TOTAL_TIMEOUT = 90  # seconds before any still-running signal is marked as timed out
+    TOTAL_TIMEOUT = 90  # seconds before any still-running signal is abandoned
 
     completed = 0
     with ThreadPoolExecutor(max_workers=5) as pool:
@@ -358,16 +364,10 @@ def main():
                     text=f"Checking signals… {completed} of {total} done",
                 )
         except FuturesTimeoutError:
-            # Mark any signals that never finished as errors so the app can render
-            for future, key in futures_map.items():
-                if key not in results:
-                    results[key] = {
-                        "status":      "ERROR",
-                        "message":     "Query timed out — signal skipped",
-                        "detail_df":   pd.DataFrame(),
-                        "alert_count": 0,
-                    }
-            progress.progress(1.0, text="Done (some signals timed out)")
+            # Results for timed-out signals are already pre-populated above —
+            # just fill the progress bar and show which ones didn't finish
+            timed_out = [key for key in SIGNAL_FNS if results[key]["message"].startswith("Query timed out")]
+            progress.progress(1.0, text=f"Done — {len(timed_out)} signal(s) timed out: {', '.join(timed_out)}")
 
     progress.empty()
 
