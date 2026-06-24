@@ -340,26 +340,34 @@ def main():
                 "alert_count": 0,
             }
 
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import TimeoutError as FuturesTimeoutError
+
+    TOTAL_TIMEOUT = 90  # seconds before any still-running signal is marked as timed out
+
     completed = 0
     with ThreadPoolExecutor(max_workers=5) as pool:
-        futures = {pool.submit(_run, item): item[0] for item in SIGNAL_FNS.items()}
-        for future in as_completed(futures):
-            key = futures[future]
-            try:
-                key, result = future.result(timeout=45)
-            except Exception as exc:
-                result = {
-                    "status":      "ERROR",
-                    "message":     f"Signal timed out or failed: {exc}",
-                    "detail_df":   pd.DataFrame(),
-                    "alert_count": 0,
-                }
-            results[key] = result
-            completed += 1
-            progress.progress(
-                completed / total,
-                text=f"Checking signals… {completed} of {total} done",
-            )
+        futures_map = {pool.submit(_run, item): item[0] for item in SIGNAL_FNS.items()}
+        try:
+            for future in as_completed(futures_map, timeout=TOTAL_TIMEOUT):
+                key, result = future.result()
+                results[key] = result
+                completed += 1
+                progress.progress(
+                    completed / total,
+                    text=f"Checking signals… {completed} of {total} done",
+                )
+        except FuturesTimeoutError:
+            # Mark any signals that never finished as errors so the app can render
+            for future, key in futures_map.items():
+                if key not in results:
+                    results[key] = {
+                        "status":      "ERROR",
+                        "message":     "Query timed out — signal skipped",
+                        "detail_df":   pd.DataFrame(),
+                        "alert_count": 0,
+                    }
+            progress.progress(1.0, text="Done (some signals timed out)")
 
     progress.empty()
 
