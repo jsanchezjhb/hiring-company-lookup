@@ -573,7 +573,7 @@ def check_dormancy_reactivation(company_id: int) -> Dict[str, Any]:
 
 _SUB_TABLE     = "prod_redshift_replica.stripe.customer_subscription"  # company → customer
 _CHG_TABLE     = "prod_redshift_replica.stripe.charge"                 # Signals 6, 7, 8, 9
-_DISPUTE_TABLE = "prod_redshift_replica.stripe.i_charge_dispute"       # Signal 7 — direct dispute lookup
+_DISPUTE_TABLE = "prod_redshift_replica.stripe.i_charge_dispute"               # Signal 7 — direct dispute lookup
 _CUST_TABLE    = "prod_redshift_replica.stripe.customer"               # Signal 15 email lookup
 _CO_TABLE      = "prod_redshift_replica.public.companies"              # Signal 9 name lookup
 
@@ -648,7 +648,7 @@ def check_billing_disputes(company_id: int) -> Dict[str, Any]:
     WITH {_company_customers_cte(company_id)}
     SELECT
         d.id                            AS dispute_id,
-        d.charge                        AS charge_id,
+        d.charge_id                     AS charge_id,
         ROUND(d.amount / 100.0, 2)      AS dispute_amount_usd,
         UPPER(d.currency)               AS currency,
         d.reason,
@@ -656,7 +656,7 @@ def check_billing_disputes(company_id: int) -> Dict[str, Any]:
         FROM_UNIXTIME(d.created)        AS disputed_at,
         c.customer                      AS stripe_customer
     FROM {_DISPUTE_TABLE} d
-    JOIN {_CHG_TABLE} c ON c.id = d.charge
+    JOIN {_CHG_TABLE} c ON c.id = d.charge_id
     INNER JOIN company_customers cc ON cc.stripe_customer = c.customer
     ORDER BY d.created DESC
     """
