@@ -614,7 +614,8 @@ def check_dormancy_reactivation(company_id: int) -> Dict[str, Any]:
         SELECT DISTINCT j.user_id AS account_id
         FROM {_LOCS_TABLE} l
         JOIN {_JOBS_TABLE} j ON j.location_id = l.id
-        WHERE l.company_id = {company_id}
+        WHERE l.company_id  = {company_id}
+          AND j.archived_at IS NULL
     ),
     signin_gaps AS (
         -- Accounts with a 30+ day gap between their last two sign-ins
