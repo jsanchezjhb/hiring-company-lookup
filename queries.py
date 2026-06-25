@@ -628,6 +628,7 @@ def check_dormancy_reactivation(company_id: int) -> Dict[str, Any]:
         INNER JOIN company_account_ids ca ON ca.account_id = sd.account_id
         WHERE sd.last_sign_in_at    IS NOT NULL
           AND sd.current_sign_in_at IS NOT NULL
+          AND sd.current_sign_in_at >= CURRENT_DATE - INTERVAL 6 MONTHS
           AND DATEDIFF(sd.current_sign_in_at, sd.last_sign_in_at) >= 30
     ),
     posts_after_return AS (
@@ -740,6 +741,7 @@ def check_failed_billing(company_id: int) -> Dict[str, Any]:
     FROM {_CHG_TABLE} c
     INNER JOIN company_customers cc ON cc.stripe_customer = c.customer
     WHERE c.status = 'failed'
+      AND c.created >= UNIX_TIMESTAMP() - 15768000
     ORDER BY c.created DESC
     """
     try:
@@ -813,6 +815,7 @@ def check_payment_method_changes(company_id: int) -> Dict[str, Any]:
     FROM {_CHG_TABLE} c
     INNER JOIN company_customers cc ON cc.stripe_customer = c.customer
     WHERE c.payment_method IS NOT NULL
+      AND c.created >= UNIX_TIMESTAMP() - 15768000
     GROUP BY c.payment_method
     ORDER BY first_used_at DESC
     """
@@ -1131,7 +1134,9 @@ def check_suspicious_timecards(company_id: int) -> Dict[str, Any]:
 
         job_ids = ", ".join(str(jid) for jid in jobs_df["job_id"].tolist())
 
-        # Step 2 — query timecards only for those specific job IDs
+        # Step 2 — query timecards only for those specific job IDs,
+        # filtering to employee-level jobs only so we catch manager overrides
+        # on employee punches, not managers clocking themselves in.
         tc_sql = f"""
         SELECT
             tc.id                       AS timecard_id,
@@ -1149,6 +1154,7 @@ def check_suspicious_timecards(company_id: int) -> Dict[str, Any]:
         JOIN {_JOBS_TABLE} j ON tc.job_id = j.id
         WHERE tc.job_id IN ({job_ids})
           AND tc.clock_in_source = 'manager'
+          AND LOWER(j.level)     = 'employee'
           AND tc.start_at >= CURRENT_DATE - INTERVAL 14 DAYS
           AND tc.start_at IS NOT NULL
           AND tc.end_at   IS NOT NULL
@@ -1644,6 +1650,7 @@ def check_account_info_changes(company_id: int) -> Dict[str, Any]:
     FROM company_owner co
     JOIN {_USER_VER_TABLE} uv ON uv.item_id = co.owner_id
     WHERE uv.created_at >= DATEADD(DAY, -45, CURRENT_DATE())
+      AND LOWER(uv.event) = 'update'
       AND (
           uv.object_changes LIKE '%encrypted_ssn%'
           OR uv.object_changes LIKE '%encrypted_password%'
