@@ -555,6 +555,16 @@ def check_ip_location_mismatch(company_id: int) -> Dict[str, Any]:
                 0,
             )
 
+        # Deduplicate on (company_id, ip) — same signup event can appear in both
+        # Heap and Amplitude. Keep the row with the most complete geo data.
+        if "ip" in df.columns and "ip_city" in df.columns:
+            df["_geo_score"] = (df["ip_city"].notna() & (df["ip_city"] != "None")).astype(int) + \
+                               (df["ip_region"].notna() & (df["ip_region"] != "None")).astype(int)
+            df = (df.sort_values("_geo_score", ascending=False)
+                    .drop_duplicates(subset=["company_id", "ip"])
+                    .drop(columns="_geo_score")
+                    .reset_index(drop=True))
+
         # Count by status
         status_counts = (
             df["location_match_status"].value_counts().to_dict()
@@ -657,13 +667,13 @@ def check_dormancy_reactivation(company_id: int) -> Dict[str, Any]:
             return _result(
                 "ALERT",
                 f"{gap_int}-day gap between last sign-in ({last_signin}) and first Hiring post ({first_post})",
-                df, gap_int,
+                df, len(df),
             )
 
         return _result(
             "CLEAR",
             f"Account was active before Hiring — {gap_int} day gap before first job post",
-            df, gap_int,
+            df, len(df),
         )
     except Exception as exc:
         return _error(exc)
@@ -1221,25 +1231,22 @@ def check_payment_method_on_file(company_id: int) -> Dict[str, Any]:
           AND customer IS NOT NULL
     ),
     stored_pms AS (
-        SELECT cs.customer, cs.id AS pm_id, cs.fingerprint, 'customer_source' AS pm_type
+        SELECT cs.customer, cs.id AS pm_id, 'customer_source' AS pm_type
         FROM {_CUST_SRC_TABLE} cs
         INNER JOIN company_customers cc ON cc.stripe_customer = cs.customer
         WHERE cs.row_deleted_at IS NULL
-          AND cs.fingerprint IS NOT NULL
 
         UNION ALL
 
-        SELECT pm.customer, pm.id AS pm_id,
-               GET_JSON_OBJECT(pm.card, '$.fingerprint') AS fingerprint,
-               'payment_method' AS pm_type
+        -- Accept any payment method type (card, us_bank_account, etc.)
+        SELECT pm.customer, pm.id AS pm_id, pm.type AS pm_type
         FROM {_PM_TABLE} pm
         INNER JOIN company_customers cc ON cc.stripe_customer = pm.customer
         WHERE pm.row_deleted_at IS NULL
-          AND GET_JSON_OBJECT(pm.card, '$.fingerprint') IS NOT NULL
     )
     SELECT
         cc.stripe_customer,
-        COUNT(DISTINCT spm.fingerprint)                             AS payment_methods_count,
+        COUNT(DISTINCT spm.pm_id)                                           AS payment_methods_count,
         COUNT(c.id)                                                 AS total_charges,
         SUM(CASE WHEN c.status = 'succeeded' THEN 1 ELSE 0 END)    AS successful_charges,
         SUM(CASE WHEN c.status = 'failed'    THEN 1 ELSE 0 END)    AS failed_charges,
