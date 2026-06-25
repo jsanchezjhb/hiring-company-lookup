@@ -1141,7 +1141,9 @@ def check_suspicious_timecards(company_id: int) -> Dict[str, Any]:
 
         job_ids = ", ".join(str(jid) for jid in jobs_df["job_id"].tolist())
 
-        # Step 2 — find manager-added or manager-edited entries on clock-ins AND clock-outs
+        # Step 2 — only timecards where manager_added = true on BOTH clock-in AND clock-out
+        # Inner join on both tables ensures the whole timecard was manager-created,
+        # not just a partial edit on one side.
         tc_sql = f"""
         SELECT
             tc.id               AS timecard_id,
@@ -1152,53 +1154,29 @@ def check_suspicious_timecards(company_id: int) -> Dict[str, Any]:
             tc.end_at,
             tc.clock_in_source,
             tc.clock_out_source,
-            tc.approved,
-            entry.manager_action,
-            entry.punch_type
-        FROM (
-            SELECT
-                ci.timecard_id,
-                CASE
-                    WHEN ci.manager_added  = true THEN 'Manager Added'
-                    WHEN ci.manager_edited = true THEN 'Manager Edited'
-                END             AS manager_action,
-                'clock_in'      AS punch_type
-            FROM {_TC_CLOCKINS_TABLE} ci
-            WHERE ci.manager_added = true OR ci.manager_edited = true
-
-            UNION ALL
-
-            SELECT
-                co.timecard_id,
-                CASE
-                    WHEN co.manager_added  = true THEN 'Manager Added'
-                    WHEN co.manager_edited = true THEN 'Manager Edited'
-                END             AS manager_action,
-                'clock_out'     AS punch_type
-            FROM {_TC_CLOCKOUTS_TABLE} co
-            WHERE co.manager_added = true OR co.manager_edited = true
-        ) entry
-        JOIN {_TIMECARDS_TABLE} tc ON tc.id     = entry.timecard_id
-        JOIN {_JOBS_TABLE}      j  ON tc.job_id = j.id
+            tc.approved
+        FROM {_TIMECARDS_TABLE}    tc
+        JOIN {_TC_CLOCKINS_TABLE}  ci ON ci.timecard_id = tc.id  AND ci.manager_added = true
+        JOIN {_TC_CLOCKOUTS_TABLE} co ON co.timecard_id = tc.id  AND co.manager_added = true
+        JOIN {_JOBS_TABLE}          j ON tc.job_id      = j.id
         WHERE tc.job_id IN ({job_ids})
           AND tc.start_at >= CURRENT_DATE - INTERVAL 14 DAYS
           AND tc.start_at IS NOT NULL
         ORDER BY tc.start_at DESC
-        LIMIT 200
+        LIMIT 100
         """
         df    = run_query(tc_sql)
-        count = df["timecard_id"].nunique() if not df.empty else 0
+        count = len(df)
         flagged = count > THRESHOLD
         if flagged:
             msg = (
-                f"{count} employee timecard{'s' if count != 1 else ''} with manager "
-                f"clock-in or clock-out entries in the last 14 days "
+                f"{count} fully manager-created timecard{'s' if count != 1 else ''} in the last 14 days "
                 f"— exceeds threshold of {THRESHOLD}"
             )
         elif count > 0:
-            msg = f"{count} manager timecard {'entries' if count != 1 else 'entry'} in the last 14 days — within normal range"
+            msg = f"{count} fully manager-created timecard{'s' if count != 1 else ''} in the last 14 days — within normal range"
         else:
-            msg = "No manager-added or edited employee timecards in the last 14 days"
+            msg = "No fully manager-created employee timecards in the last 14 days"
         return _result("ALERT" if flagged else "CLEAR", msg, df if flagged else pd.DataFrame(), count)
     except Exception as exc:
         return _error(exc)
