@@ -14,7 +14,9 @@ from queries import (
     check_active_job_posts,
     check_rapid_postings,
     check_hourly_burst,
+    check_daily_burst,
     check_ip_location_mismatch,
+    check_device_id_reuse,
     check_dormancy_reactivation,
     check_failed_billing,
     check_billing_disputes,
@@ -27,6 +29,7 @@ from queries import (
     check_employee_documents,
     check_payment_method_on_file,
     check_owner_multi_company,
+    check_employee_multi_company,
 )
 
 # ─── Page config (must be first Streamlit call) ───────────────────────────────
@@ -242,10 +245,12 @@ def main():
             unsafe_allow_html=True,
         )
         signals_info = [
-            ("📋", "Active Job Posts",              "10+ active jobs at the same time"),
-            ("⚡", "Rapid Posting",                 "Multiple jobs created < 1 minute apart"),
-            ("📈", "Hourly Burst",                  "4+ jobs posted within a single hour"),
+            ("📋", "Active Job Posts",                 "20+ active jobs at the same time"),
+            ("⚡", "Rapid Posting",                    "Multiple jobs created < 1 minute apart"),
+            ("📈", "Hourly Burst",                     "4+ jobs posted within a single hour"),
+            ("📅", "Daily Burst",                      "10+ jobs posted in a single day"),
             ("🌐", "IP / Location Mismatch",        "Account IP doesn't match company city/state"),
+            ("📱", "Device ID Reuse",                "Same device used to sign up for other companies"),
             ("💤", "Dormancy Reactivation",          "30+ day gap then sudden job posting"),
             ("💳", "Failed Billing",                "Unsuccessful Stripe billing attempts"),
             ("⚖️", "Billing Disputes",              "Open or resolved billing disputes"),
@@ -257,6 +262,7 @@ def main():
             ("🕐", "Suspicious Timecard Overrides", "Manager entered 3+ punches in the last pay period"),
             ("📁", "Employee Documents",            "Onboarding documents pre-uploaded on a new account"),
             ("🔗", "Manager Linked to Other Companies", "Manager email/phone found at other company accounts"),
+            ("👥", "Employees at Multiple Companies",   "Employees appearing at more than 2 other companies"),
             ("💰", "Payment Method on File",        "No Stripe payment method linked to this company"),
         ]
         for icon, name, desc in signals_info:
@@ -310,7 +316,9 @@ def main():
         "active_jobs":           check_active_job_posts,
         "rapid_postings":        check_rapid_postings,
         "hourly_burst":          check_hourly_burst,
+        "daily_burst":           check_daily_burst,
         "ip_mismatch":           check_ip_location_mismatch,
+        "device_id_reuse":       check_device_id_reuse,
         "dormancy":              check_dormancy_reactivation,
         "failed_billing":        check_failed_billing,
         "disputes":              check_billing_disputes,
@@ -323,6 +331,7 @@ def main():
         "employee_documents":    check_employee_documents,
         "payment_method":        check_payment_method_on_file,
         "owner_multi_company":   check_owner_multi_company,
+        "employee_multi_company": check_employee_multi_company,
     }
 
     # Section layout — defines display order and all card metadata
@@ -339,6 +348,16 @@ def main():
                         "ALERTs on any 'No Match' result. "
                         "The mismatch_pct column shows the heuristic fraud likelihood "
                         "(e.g. known CDN cities like Ashburn score lower than a foreign-country IP)."
+                    ),
+                },
+                {
+                    "key": "device_id_reuse", "icon": "📱",
+                    "title": "Device ID Reuse Across Companies",
+                    "description": (
+                        "Checks whether the device used at signup for this company also appears in "
+                        "signup records for other companies. Pulls heap_device_id from Heap and heap_id "
+                        "from Amplitude. A shared device across multiple company signups strongly "
+                        "suggests the same person created multiple accounts."
                     ),
                 },
             ],
@@ -403,6 +422,15 @@ def main():
                         "Not a dealbreaker on its own, but warrants investigation."
                     ),
                 },
+                {
+                    "key": "employee_multi_company", "icon": "👥",
+                    "title": "Employees Listed at Multiple Other Companies",
+                    "description": (
+                        "Checks the first 10 employee accounts (with email or phone) and flags any "
+                        "that appear at more than 2 other companies. Matched by email address or phone number. "
+                        "A high overlap with other companies may indicate shared or recycled employee lists."
+                    ),
+                },
             ],
         },
         {
@@ -460,7 +488,7 @@ def main():
                     "key": "active_jobs", "icon": "📋",
                     "title": "Active Job Posts",
                     "description": (
-                        "Flags companies with 10 or more currently active job postings. "
+                        "Flags companies with 20 or more currently active job postings. "
                         "Legitimate businesses rarely maintain this many simultaneous open roles."
                     ),
                 },
@@ -478,6 +506,15 @@ def main():
                     "description": (
                         "Flags when 4 or more jobs were posted within the same clock hour. "
                         "Expands to show every job in the flagged window."
+                    ),
+                },
+                {
+                    "key": "daily_burst", "icon": "📅",
+                    "title": "Daily Posting Burst — 10+ Jobs in One Day",
+                    "description": (
+                        "Flags when 10 or more jobs were posted on a single calendar day. "
+                        "Complements the sub-minute and hourly signals by catching sustained "
+                        "high-volume posting spread across a full day."
                     ),
                 },
                 {
