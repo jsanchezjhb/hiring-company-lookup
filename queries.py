@@ -685,13 +685,15 @@ def check_dormancy_reactivation(company_id: int) -> Dict[str, Any]:
 # Tables confirmed from SHOW TABLES IN prod_redshift_replica.stripe
 # Company linkage: GET_JSON_OBJECT(metadata, '$.company_id') on customer_subscription
 
-_SUB_TABLE     = "prod_redshift_replica.stripe.customer_subscription"  # company → customer
-_CHG_TABLE     = "prod_redshift_replica.stripe.charge"                 # Signals 6, 7, 8, 9
-_DISPUTE_TABLE = "prod_redshift_replica.stripe.i_charge_dispute"       # Signal 7 — direct dispute lookup
-_CUST_TABLE    = "prod_redshift_replica.stripe.customer"               # Signal 15 customer lookup
-_CUST_SRC_TABLE= "prod_redshift_replica.stripe.customer_source"        # Signals 9, 15 — stored cards (fingerprint col)
-_PM_TABLE      = "prod_redshift_replica.stripe.payment_method"         # Signals 9, 15 — PaymentMethod API cards
-_CO_TABLE      = "prod_redshift_replica.public.companies"              # Signal 9 name lookup
+_SUB_TABLE      = "prod_redshift_replica.stripe.customer_subscription"  # company → customer
+_CHG_TABLE      = "prod_redshift_replica.stripe.charge"                 # Signals 6, 7, 8, 9
+_DISPUTE_TABLE  = "prod_redshift_replica.stripe.i_charge_dispute"       # Signal 7 — direct dispute lookup
+_CUST_TABLE     = "prod_redshift_replica.stripe.customer"               # Signal 15 customer lookup
+_CUST_SRC_TABLE = "prod_redshift_replica.stripe.customer_source"        # Signals 9, 15 — stored cards (fingerprint col)
+_PM_TABLE       = "prod_redshift_replica.stripe.payment_method"         # Signals 9, 15 — PaymentMethod API cards
+_CO_TABLE       = "prod_redshift_replica.public.companies"              # Signal 9 name lookup
+_PG_CO_TABLE    = "prod_redshift_replica.postgres.companies"            # Signals 20, 21 — has owner_id
+_USER_VER_TABLE = "prod_redshift_replica.postgres.user_versions"        # Signals 20, 21 — account change audit log
 
 # customer_subscription.metadata contains company_id as a JSON string:
 #   {"company_id":"1311802","location_id":"1415801", ...}
@@ -1584,6 +1586,178 @@ def check_device_id_reuse(company_id: int) -> Dict[str, Any]:
             )
         else:
             msg = "No shared device IDs detected across other companies"
+        return _result("ALERT" if flagged else "CLEAR", msg, df, count)
+    except Exception as exc:
+        return _error(exc)
+
+# ---------------------------------------------------------------------------
+# Signal 20 — Owner Account Info Changes (Last 45 Days)
+# ---------------------------------------------------------------------------
+
+def check_account_info_changes(company_id: int) -> Dict[str, Any]:
+    """
+    ALERT if any sensitive field on the owner account was changed in the last
+    45 days: SSN, password, email, phone, or name fields.
+    Potential indicator of account takeover.
+    Uses postgres.companies.owner_id → postgres.user_versions.item_id.
+    """
+    sql = f"""
+    WITH company_owner AS (
+        SELECT
+            c.id            AS company_id,
+            c.name          AS company_name,
+            c.owner_id,
+            a.email         AS current_email,
+            a.first_name    AS current_first_name,
+            a.last_name     AS current_last_name,
+            a.phone         AS current_phone
+        FROM {_PG_CO_TABLE} c
+        JOIN {_ACCOUNTS_TABLE} a ON a.id = c.owner_id
+        WHERE c.id = {company_id}
+    )
+    SELECT
+        co.company_id,
+        co.owner_id         AS account_id,
+        co.current_email,
+        co.current_first_name,
+        co.current_last_name,
+        co.current_phone,
+        uv.event,
+        uv.whodunnit,
+        uv.ip               AS change_ip,
+        uv.admin_user_id,
+        uv.created_at       AS change_timestamp,
+        CASE
+            WHEN uv.object_changes LIKE '%encrypted_ssn%'                               THEN 'SSN'
+            WHEN uv.object_changes LIKE '%encrypted_password%'                          THEN 'Password'
+            WHEN uv.object_changes LIKE '%email%'                                       THEN 'Email'
+            WHEN uv.object_changes LIKE '%phone%'                                       THEN 'Phone'
+            WHEN uv.object_changes LIKE '%first_name%'
+              OR uv.object_changes LIKE '%last_name%'
+              OR uv.object_changes LIKE '%legal_first_name%'
+              OR uv.object_changes LIKE '%legal_last_name%'                             THEN 'Name'
+        END                 AS change_type
+    FROM company_owner co
+    JOIN {_USER_VER_TABLE} uv ON uv.item_id = co.owner_id
+    WHERE uv.created_at >= DATEADD(DAY, -45, CURRENT_DATE())
+      AND (
+          uv.object_changes LIKE '%encrypted_ssn%'
+          OR uv.object_changes LIKE '%encrypted_password%'
+          OR uv.object_changes LIKE '%email%'
+          OR uv.object_changes LIKE '%phone%'
+          OR uv.object_changes LIKE '%first_name%'
+          OR uv.object_changes LIKE '%last_name%'
+          OR uv.object_changes LIKE '%legal_first_name%'
+          OR uv.object_changes LIKE '%legal_last_name%'
+      )
+    ORDER BY uv.created_at DESC
+    """
+    try:
+        df    = run_query(sql)
+        count = len(df)
+        flagged = count > 0
+        if flagged:
+            change_types = df["change_type"].dropna().unique().tolist() if "change_type" in df.columns else []
+            msg = (
+                f"{count} sensitive field change{'s' if count != 1 else ''} in the last 45 days "
+                f"({', '.join(change_types)})"
+            )
+        else:
+            msg = "No sensitive account changes detected in the last 45 days"
+        return _result("ALERT" if flagged else "CLEAR", msg, df, count)
+    except Exception as exc:
+        return _error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Signal 21 — Account Change from Different IP
+# ---------------------------------------------------------------------------
+
+def check_account_change_ip(company_id: int) -> Dict[str, Any]:
+    """
+    ALERT if any sensitive account change in the last 45 days was made from
+    a different IP address than the owner's original signup IP.
+    Indicates the change may have been made by someone other than the original owner.
+    Cross-references user_versions.ip against signup IP from Heap and Amplitude.
+    """
+    sql = f"""
+    WITH company_owner AS (
+        SELECT c.owner_id
+        FROM {_PG_CO_TABLE} c
+        WHERE c.id = {company_id}
+    ),
+    signup_ips AS (
+        SELECT DISTINCT ip AS signup_ip
+        FROM {_IP_SIGNUP_TABLE}
+        WHERE company_id = '{company_id}'
+          AND ip IS NOT NULL
+
+        UNION
+
+        SELECT DISTINCT ip_address AS signup_ip
+        FROM {_AMPLITUDE_TABLE}
+        WHERE company_id = {company_id}
+          AND ip_address IS NOT NULL
+    ),
+    recent_changes AS (
+        SELECT
+            uv.item_id      AS account_id,
+            uv.event,
+            uv.ip           AS change_ip,
+            uv.whodunnit,
+            uv.admin_user_id,
+            uv.created_at   AS change_timestamp,
+            CASE
+                WHEN uv.object_changes LIKE '%encrypted_ssn%'      THEN 'SSN'
+                WHEN uv.object_changes LIKE '%encrypted_password%' THEN 'Password'
+                WHEN uv.object_changes LIKE '%email%'              THEN 'Email'
+                WHEN uv.object_changes LIKE '%phone%'              THEN 'Phone'
+                WHEN uv.object_changes LIKE '%first_name%'
+                  OR uv.object_changes LIKE '%last_name%'
+                  OR uv.object_changes LIKE '%legal_first_name%'
+                  OR uv.object_changes LIKE '%legal_last_name%'    THEN 'Name'
+            END             AS change_type
+        FROM company_owner co
+        JOIN {_USER_VER_TABLE} uv ON uv.item_id = co.owner_id
+        WHERE uv.created_at >= DATEADD(DAY, -45, CURRENT_DATE())
+          AND uv.ip IS NOT NULL
+          AND (
+              uv.object_changes LIKE '%encrypted_ssn%'
+              OR uv.object_changes LIKE '%encrypted_password%'
+              OR uv.object_changes LIKE '%email%'
+              OR uv.object_changes LIKE '%phone%'
+              OR uv.object_changes LIKE '%first_name%'
+              OR uv.object_changes LIKE '%last_name%'
+              OR uv.object_changes LIKE '%legal_first_name%'
+              OR uv.object_changes LIKE '%legal_last_name%'
+          )
+    )
+    SELECT
+        rc.account_id,
+        rc.change_type,
+        rc.change_ip,
+        si.signup_ip,
+        rc.event,
+        rc.whodunnit,
+        rc.admin_user_id,
+        rc.change_timestamp
+    FROM recent_changes rc
+    CROSS JOIN signup_ips si
+    WHERE rc.change_ip != si.signup_ip
+    ORDER BY rc.change_timestamp DESC
+    """
+    try:
+        df    = run_query(sql)
+        count = len(df)
+        flagged = count > 0
+        if flagged:
+            change_types = df["change_type"].dropna().unique().tolist() if "change_type" in df.columns else []
+            msg = (
+                f"{count} sensitive change{'s' if count != 1 else ''} made from a different IP than signup "
+                f"({', '.join(change_types)})"
+            )
+        else:
+            msg = "All recent account changes came from the same IP as signup"
         return _result("ALERT" if flagged else "CLEAR", msg, df, count)
     except Exception as exc:
         return _error(exc)
