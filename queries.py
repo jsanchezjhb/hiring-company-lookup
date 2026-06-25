@@ -953,11 +953,13 @@ def check_fingerprint_reuse(company_id: int) -> Dict[str, Any]:
 #   Email verified : confirmed_at IS NOT NULL
 #   Phone verified : needs_phone_confirmation = false
 
-_ACCOUNTS_TABLE  = "prod_redshift_replica.postgres.accounts"
-_JOBS_TABLE      = "prod_redshift_replica.postgres.jobs"
-_LOCS_TABLE      = "prod_redshift_replica.postgres.locations"
-_TIMECARDS_TABLE = "prod_redshift_replica.postgres.timecards"
-_ONBOARD_DOCS    = "prod_redshift_replica.postgres.employee_onboarding_documents"
+_ACCOUNTS_TABLE   = "prod_redshift_replica.postgres.accounts"
+_JOBS_TABLE       = "prod_redshift_replica.postgres.jobs"
+_LOCS_TABLE       = "prod_redshift_replica.postgres.locations"
+_TIMECARDS_TABLE  = "prod_redshift_replica.postgres.timecards"
+_ONBOARD_DOCS     = "prod_redshift_replica.postgres.employee_onboarding_documents"
+_TC_CLOCKINS_TABLE  = "prod_redshift_replica.bizops.timecard_clockins"   # manager_added, manager_edited flags
+_TC_CLOCKOUTS_TABLE = "prod_redshift_replica.bizops.timecard_clockouts"  # same flags for clock-outs
 
 _FRAUD_DOMAINS_SQL = (
     "'mail.com', 'engineer.com', 'usa.com', 'consultant.com', 'myself.com', "
@@ -1111,56 +1113,95 @@ def check_employee_verification(company_id: int) -> Dict[str, Any]:
 
 def check_suspicious_timecards(company_id: int) -> Dict[str, Any]:
     """
-    ALERT if a manager entered more than 3 timecard punches in the last 14 days.
-    Uses a two-step approach to avoid a full timecards table scan:
-      Step 1: fetch job IDs for this company (fast — small result)
-      Step 2: query timecards WHERE job_id IN (...) using the explicit ID list
-    Short-circuits immediately if the company has no active jobs.
+    ALERT if a manager created or edited more than 3 employee timecard entries
+    in the last 14 days.
+
+    Uses bizops.timecard_clockins which has explicit boolean flags:
+      manager_added  — manager created the clock-in entry
+      manager_edited — manager edited an existing clock-in entry
+
+    Two-step approach: fetch employee job IDs first, then query clockins
+    for those specific IDs to avoid scanning the full timecards table.
     """
     THRESHOLD = 3
 
-    # Step 1 — get job IDs for this company
+    # Step 1 — get employee-level job IDs for this company
     jobs_sql = f"""
     SELECT j.id AS job_id
     FROM {_LOCS_TABLE} l
     JOIN {_JOBS_TABLE} j ON j.location_id = l.id
     WHERE l.company_id = {company_id}
       AND j.archived_at IS NULL
+      AND LOWER(j.level) = 'employee'
     """
     try:
         jobs_df = run_query(jobs_sql)
         if jobs_df.empty:
-            return _result("CLEAR", "No active jobs found for this company", pd.DataFrame(), 0)
+            return _result("CLEAR", "No active employee jobs found for this company", pd.DataFrame(), 0)
 
         job_ids = ", ".join(str(jid) for jid in jobs_df["job_id"].tolist())
 
-        # Step 2 — query timecards only for those specific job IDs,
-        # filtering to employee-level jobs only so we catch manager overrides
-        # on employee punches, not managers clocking themselves in.
+        # Step 2 — find manager-added or manager-edited entries on clock-ins AND clock-outs
         tc_sql = f"""
         SELECT
-            tc.id                       AS timecard_id,
+            tc.id               AS timecard_id,
+            tc.job_id,
             j.user_id,
-            j.level                     AS user_role,
+            j.level             AS user_role,
             tc.start_at,
             tc.end_at,
             tc.clock_in_source,
             tc.clock_out_source,
             tc.approved,
-            DAYOFWEEK(tc.start_at)      AS day_of_week,
-            HOUR(tc.start_at)           AS start_hour,
-            HOUR(tc.end_at)             AS end_hour
-        FROM {_TIMECARDS_TABLE} tc
-        JOIN {_JOBS_TABLE} j ON tc.job_id = j.id
+            entry.manager_action,
+            entry.punch_type
+        FROM (
+            SELECT
+                ci.timecard_id,
+                CASE
+                    WHEN ci.manager_added  = true THEN 'Manager Added'
+                    WHEN ci.manager_edited = true THEN 'Manager Edited'
+                END             AS manager_action,
+                'clock_in'      AS punch_type
+            FROM {_TC_CLOCKINS_TABLE} ci
+            WHERE ci.manager_added = true OR ci.manager_edited = true
+
+            UNION ALL
+
+            SELECT
+                co.timecard_id,
+                CASE
+                    WHEN co.manager_added  = true THEN 'Manager Added'
+                    WHEN co.manager_edited = true THEN 'Manager Edited'
+                END             AS manager_action,
+                'clock_out'     AS punch_type
+            FROM {_TC_CLOCKOUTS_TABLE} co
+            WHERE co.manager_added = true OR co.manager_edited = true
+        ) entry
+        JOIN {_TIMECARDS_TABLE} tc ON tc.id     = entry.timecard_id
+        JOIN {_JOBS_TABLE}      j  ON tc.job_id = j.id
         WHERE tc.job_id IN ({job_ids})
-          AND tc.clock_in_source = 'manager'
-          AND LOWER(j.level)     = 'employee'
           AND tc.start_at >= CURRENT_DATE - INTERVAL 14 DAYS
           AND tc.start_at IS NOT NULL
-          AND tc.end_at   IS NOT NULL
         ORDER BY tc.start_at DESC
-        LIMIT 100
+        LIMIT 200
         """
+        df    = run_query(tc_sql)
+        count = df["timecard_id"].nunique() if not df.empty else 0
+        flagged = count > THRESHOLD
+        if flagged:
+            msg = (
+                f"{count} employee timecard{'s' if count != 1 else ''} with manager "
+                f"clock-in or clock-out entries in the last 14 days "
+                f"— exceeds threshold of {THRESHOLD}"
+            )
+        elif count > 0:
+            msg = f"{count} manager timecard {'entries' if count != 1 else 'entry'} in the last 14 days — within normal range"
+        else:
+            msg = "No manager-added or edited employee timecards in the last 14 days"
+        return _result("ALERT" if flagged else "CLEAR", msg, df if flagged else pd.DataFrame(), count)
+    except Exception as exc:
+        return _error(exc)
         df    = run_query(tc_sql)
         count = len(df)
         flagged = count > THRESHOLD
