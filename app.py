@@ -30,6 +30,8 @@ from queries import (
     check_payment_method_on_file,
     check_owner_multi_company,
     check_employee_multi_company,
+    check_account_info_changes,
+    check_account_change_ip,
 )
 
 # ─── Page config (must be first Streamlit call) ───────────────────────────────
@@ -251,6 +253,8 @@ def main():
             ("📅", "Daily Burst",                      "10+ jobs posted in a single day"),
             ("🌐", "IP / Location Mismatch",        "Account IP doesn't match company city/state"),
             ("📱", "Device ID Reuse",                "Same device used to sign up for other companies"),
+            ("✏️", "Owner Account Info Changes",     "SSN/password/email/phone/name changed in last 45 days"),
+            ("🔀", "Account Change from Different IP", "Sensitive change made from different IP than signup"),
             ("💤", "Dormancy Reactivation",          "30+ day gap then sudden job posting"),
             ("💳", "Failed Billing",                "Unsuccessful Stripe billing attempts"),
             ("⚖️", "Billing Disputes",              "Open or resolved billing disputes"),
@@ -329,9 +333,11 @@ def main():
         "employee_verification": check_employee_verification,
         "suspicious_timecards":  check_suspicious_timecards,
         "employee_documents":    check_employee_documents,
-        "payment_method":        check_payment_method_on_file,
-        "owner_multi_company":   check_owner_multi_company,
+        "payment_method":         check_payment_method_on_file,
+        "owner_multi_company":    check_owner_multi_company,
         "employee_multi_company": check_employee_multi_company,
+        "account_info_changes":   check_account_info_changes,
+        "account_change_ip":      check_account_change_ip,
     }
 
     # Section layout — defines display order and all card metadata
@@ -358,6 +364,25 @@ def main():
                         "signup records for other companies. Pulls heap_device_id from Heap and heap_id "
                         "from Amplitude. A shared device across multiple company signups strongly "
                         "suggests the same person created multiple accounts."
+                    ),
+                },
+                {
+                    "key": "account_info_changes", "icon": "✏️",
+                    "title": "Owner Account Info Changes (Last 45 Days)",
+                    "description": (
+                        "Flags if any sensitive field on the owner account was changed in the last 45 days: "
+                        "SSN, password, email, phone, or name. Sourced from the user_versions audit log. "
+                        "Recent changes to sensitive fields may indicate an account takeover."
+                    ),
+                },
+                {
+                    "key": "account_change_ip", "icon": "🔀",
+                    "title": "Account Change from Different IP",
+                    "description": (
+                        "Flags if any sensitive account change in the last 45 days was made from a "
+                        "different IP address than the owner's original signup IP. "
+                        "A different IP at change time suggests someone other than the original owner "
+                        "may have made the modification."
                     ),
                 },
             ],
