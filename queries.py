@@ -601,14 +601,13 @@ _SIGNIN_TABLE = "prod_redshift_replica.postgres.account_sign_in_details"
 
 def check_dormancy_reactivation(company_id: int) -> Dict[str, Any]:
     """
-    ALERT if the company had zero sign-in activity for 30+ days before their
-    first Hiring job post — indicating the account was dormant then suddenly
-    activated for Hiring.
+    ALERT if any account linked to this company had a 30+ day gap between
+    consecutive sign-ins (last_sign_in_at → current_sign_in_at) AND posted
+    Hiring jobs after coming back.
 
-    last_signin_at  = most recent sign-in across all company accounts,
-                      using GREATEST(current_sign_in_at, last_sign_in_at)
-    first_post_at   = earliest activated hiring_job_request for this company
-    Gap             = DATEDIFF(first_post_at, last_signin_at)
+    Pattern: was inactive 30+ days → signed back in → started posting Hiring jobs.
+    Uses account_sign_in_details which stores the two most recent sign-in timestamps
+    per account, giving us the gap between the last two logins.
     """
     sql = f"""
     WITH company_account_ids AS (
@@ -617,64 +616,68 @@ def check_dormancy_reactivation(company_id: int) -> Dict[str, Any]:
         JOIN {_JOBS_TABLE} j ON j.location_id = l.id
         WHERE l.company_id = {company_id}
     ),
-    last_signin AS (
-        SELECT GREATEST(
-            MAX(sd.current_sign_in_at),
-            MAX(sd.last_sign_in_at)
-        ) AS last_signin_at
+    signin_gaps AS (
+        -- Accounts with a 30+ day gap between their last two sign-ins
+        SELECT
+            sd.account_id,
+            sd.last_sign_in_at                                          AS dormant_since,
+            sd.current_sign_in_at                                       AS returned_at,
+            DATEDIFF(sd.current_sign_in_at, sd.last_sign_in_at)        AS gap_days
         FROM {_SIGNIN_TABLE} sd
         INNER JOIN company_account_ids ca ON ca.account_id = sd.account_id
+        WHERE sd.last_sign_in_at    IS NOT NULL
+          AND sd.current_sign_in_at IS NOT NULL
+          AND DATEDIFF(sd.current_sign_in_at, sd.last_sign_in_at) >= 30
     ),
-    first_job AS (
-        SELECT MIN(hjr.created_at) AS first_post_at
-        FROM postgres.hiring_job_requests hjr
+    posts_after_return AS (
+        -- First Hiring job posted after the account returned from dormancy
+        SELECT
+            sg.account_id,
+            sg.dormant_since,
+            sg.returned_at,
+            sg.gap_days,
+            MIN(hjr.created_at) AS first_post_after_return
+        FROM signin_gaps sg
+        JOIN postgres.hiring_job_requests hjr
+          ON hjr.created_at >= sg.returned_at
         INNER JOIN public.locations l ON l.location_id = hjr.location_id
         INNER JOIN public.companies c ON c.company_id  = l.company_id
-        WHERE c.company_id        = {company_id}
-          AND hjr.hiring_version  = 2
-          AND hjr.status         != 'draft'
+        WHERE c.company_id      = {company_id}
+          AND hjr.hiring_version = 2
+          AND hjr.status        != 'draft'
           AND (hjr.activated_at IS NOT NULL OR hjr.flagged_at IS NOT NULL)
           {EXCLUDE_TEST_COMPANY}
+        GROUP BY sg.account_id, sg.dormant_since, sg.returned_at, sg.gap_days
     )
     SELECT
-        ls.last_signin_at,
-        fj.first_post_at,
-        DATEDIFF(fj.first_post_at, ls.last_signin_at) AS gap_days
-    FROM last_signin ls
-    CROSS JOIN first_job fj
-    WHERE fj.first_post_at IS NOT NULL
+        account_id,
+        dormant_since,
+        returned_at,
+        gap_days,
+        first_post_after_return
+    FROM posts_after_return
+    ORDER BY gap_days DESC
     """
     try:
         df = run_query(sql)
 
-        if df.empty or df["first_post_at"].isna().all():
-            return _result("PENDING", "No hiring job posts found for this company", df, 0)
-
-        last_signin = df["last_signin_at"].iloc[0]
-        first_post  = df["first_post_at"].iloc[0]
-        gap         = df["gap_days"].iloc[0]
-
-        if last_signin is None or str(last_signin) in ("", "NaT", "None"):
+        if df.empty:
             return _result(
-                "ALERT",
-                f"No account sign-ins found before first Hiring post ({first_post}) — zero prior activity",
+                "CLEAR",
+                "No dormancy-then-posting pattern detected",
                 df, 0,
             )
 
-        gap_int = int(gap) if gap is not None else 0
-
-        if gap_int >= 30:
-            return _result(
-                "ALERT",
-                f"{gap_int}-day gap between last sign-in ({last_signin}) and first Hiring post ({first_post})",
-                df, len(df),
-            )
-
-        return _result(
-            "CLEAR",
-            f"Account was active before Hiring — {gap_int} day gap before first job post",
-            df, len(df),
+        count   = len(df)
+        max_gap = int(df["gap_days"].max()) if "gap_days" in df.columns else 0
+        msg = (
+            f"{count} account{'s' if count != 1 else ''} returned after {max_gap}+ days dormant "
+            f"and posted Hiring jobs"
         )
+        return _result("ALERT", msg, df, count)
+    except Exception as exc:
+        return _error(exc)
+
     except Exception as exc:
         return _error(exc)
 
