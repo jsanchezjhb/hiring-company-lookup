@@ -128,15 +128,15 @@ def get_company_info(company_id: int) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Signal 1 — 10+ Active Job Posts
+# Signal 1 — 20+ Active Job Posts
 # ---------------------------------------------------------------------------
 
 def check_active_job_posts(company_id: int) -> Dict[str, Any]:
     """
-    ALERT if the company currently has 10 or more active job posts
+    ALERT if the company currently has 20 or more active job posts
     across all of its locations.
     """
-    THRESHOLD = 10
+    THRESHOLD = 20
     sql = f"""
     SELECT
         hjr.id                                          AS job_post_id,
@@ -299,6 +299,70 @@ def check_hourly_burst(company_id: int) -> Dict[str, Any]:
             "No hourly burst activity detected"
         )
         return _result("ALERT" if flagged else "CLEAR", msg, df, hours_flagged)
+    except Exception as exc:
+        return _error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Signal 3b — Daily Posting Burst (10+ Jobs in One Day)
+# ---------------------------------------------------------------------------
+
+def check_daily_burst(company_id: int) -> Dict[str, Any]:
+    """
+    ALERT if 10 or more jobs were posted on any single calendar day.
+    Complements the sub-minute and hourly burst signals by catching
+    sustained high-volume posting spread across a full day.
+    """
+    THRESHOLD = 10
+    sql = f"""
+    WITH daily_counts AS (
+        SELECT
+            CAST(hjr.created_at AS DATE)    AS post_date,
+            COUNT(*)                        AS jobs_posted
+        FROM postgres.hiring_job_requests hjr
+        INNER JOIN public.locations l ON l.location_id = hjr.location_id
+        INNER JOIN public.companies c ON c.company_id  = l.company_id
+        WHERE c.company_id      = {company_id}
+          AND hjr.hiring_version = 2
+          AND hjr.status        != 'draft'
+          AND (hjr.activated_at IS NOT NULL OR hjr.flagged_at IS NOT NULL)
+          {EXCLUDE_TEST_COMPANY}
+        GROUP BY CAST(hjr.created_at AS DATE)
+        HAVING COUNT(*) >= {THRESHOLD}
+    )
+    SELECT
+        dc.post_date,
+        dc.jobs_posted,
+        hjr.id      AS job_post_id,
+        hjr.title   AS job_title,
+        hjr.status,
+        hjr.created_at,
+        l.location_id,
+        l.name      AS location_name
+    FROM daily_counts dc
+    JOIN postgres.hiring_job_requests hjr
+      ON CAST(hjr.created_at AS DATE) = dc.post_date
+    INNER JOIN public.locations l ON l.location_id = hjr.location_id
+    INNER JOIN public.companies c ON c.company_id  = l.company_id
+    WHERE c.company_id      = {company_id}
+      AND hjr.hiring_version = 2
+      AND hjr.status        != 'draft'
+      AND (hjr.activated_at IS NOT NULL OR hjr.flagged_at IS NOT NULL)
+      {EXCLUDE_TEST_COMPANY}
+    ORDER BY dc.post_date DESC, hjr.created_at ASC
+    """
+    try:
+        df           = run_query(sql)
+        days_flagged = df["post_date"].nunique() if not df.empty else 0
+        total_jobs   = len(df)
+        flagged      = days_flagged > 0
+        msg = (
+            f"{days_flagged} day{'s' if days_flagged != 1 else ''} with {THRESHOLD}+ posts "
+            f"({total_jobs} total jobs flagged)"
+            if flagged else
+            f"No single day with {THRESHOLD}+ job posts detected"
+        )
+        return _result("ALERT" if flagged else "CLEAR", msg, df, days_flagged)
     except Exception as exc:
         return _error(exc)
 
@@ -1316,6 +1380,203 @@ def check_owner_multi_company(company_id: int) -> Dict[str, Any]:
             )
         else:
             msg = "Manager accounts are not linked to any other companies"
+        return _result("ALERT" if flagged else "CLEAR", msg, df, count)
+    except Exception as exc:
+        return _error(exc)
+
+# ---------------------------------------------------------------------------
+# Signal 18 — Employees Listed at Multiple Other Companies
+# ---------------------------------------------------------------------------
+
+def check_employee_multi_company(company_id: int) -> Dict[str, Any]:
+    """
+    ALERT if any employee account on this company also appears at more than
+    2 other companies — matched by email address or phone number.
+
+    To keep the query manageable, only the first 10 employee accounts
+    (with a valid email or phone) are checked.
+    """
+    THRESHOLD = 2   # more than this many other companies = ALERT
+
+    # Step 1 — get up to 10 employee accounts for this company
+    employees_sql = f"""
+    SELECT DISTINCT a.id AS account_id, a.email, a.phone
+    FROM {_LOCS_TABLE}     l
+    JOIN {_JOBS_TABLE}     j ON j.location_id = l.id
+    JOIN {_ACCOUNTS_TABLE} a ON a.id          = j.user_id
+    WHERE l.company_id  = {company_id}
+      AND LOWER(j.level) = 'employee'
+      AND j.archived_at  IS NULL
+      AND (a.email IS NOT NULL OR a.phone IS NOT NULL)
+    LIMIT 10
+    """
+    try:
+        emp_df = run_query(employees_sql)
+        if emp_df.empty:
+            return _result("CLEAR", "No employee accounts with contact details found", pd.DataFrame(), 0)
+
+        # Build IN lists for email and phone
+        emails = [f"'{e}'" for e in emp_df["email"].dropna().tolist() if e]
+        phones = [f"'{p}'" for p in emp_df["phone"].dropna().tolist() if p]
+
+        if not emails and not phones:
+            return _result("CLEAR", "Employee accounts have no email or phone to match against", pd.DataFrame(), 0)
+
+        email_clause = f"a.email IN ({', '.join(emails)})" if emails else "false"
+        phone_clause = f"a.phone IN ({', '.join(phones)})" if phones else "false"
+
+        # Step 2 — find those accounts at other companies and count distinct companies
+        matches_sql = f"""
+        WITH other_jobs AS (
+            SELECT DISTINCT
+                a.id            AS account_id,
+                a.email,
+                a.phone,
+                LOWER(j.level)  AS role_at_other_company,
+                l.company_id    AS other_company_id,
+                CASE
+                    WHEN {email_clause} THEN 'email_match'
+                    ELSE 'phone_match'
+                END             AS match_type
+            FROM {_ACCOUNTS_TABLE} a
+            JOIN {_JOBS_TABLE}  j ON j.user_id     = a.id
+            JOIN {_LOCS_TABLE}  l ON j.location_id = l.id
+            WHERE ({email_clause} OR {phone_clause})
+              AND l.company_id != {company_id}
+              AND j.archived_at IS NULL
+        ),
+        company_counts AS (
+            SELECT
+                account_id,
+                email,
+                phone,
+                COUNT(DISTINCT other_company_id) AS other_company_count
+            FROM other_jobs
+            GROUP BY account_id, email, phone
+        )
+        SELECT
+            oj.account_id,
+            oj.email,
+            oj.phone,
+            oj.role_at_other_company,
+            oj.other_company_id,
+            c.name          AS other_company_name,
+            oj.match_type,
+            cc.other_company_count
+        FROM other_jobs oj
+        JOIN company_counts cc ON cc.account_id = oj.account_id
+        LEFT JOIN {_CO_TABLE} c ON c.company_id = oj.other_company_id
+        WHERE cc.other_company_count > {THRESHOLD}
+        ORDER BY cc.other_company_count DESC, oj.account_id, oj.other_company_id
+        LIMIT 200
+        """
+        df    = run_query(matches_sql)
+        count = len(df)
+        flagged = count > 0
+        if flagged:
+            n_employees = df["account_id"].nunique()
+            n_companies = df["other_company_id"].nunique()
+            msg = (
+                f"{n_employees} employee{'s' if n_employees != 1 else ''} "
+                f"found at more than {THRESHOLD} other {'companies' if n_companies != 1 else 'company'} "
+                f"({n_companies} other {'companies' if n_companies != 1 else 'company'} total)"
+            )
+        else:
+            msg = f"No employees found at more than {THRESHOLD} other companies (checked up to 10 employees)"
+        return _result("ALERT" if flagged else "CLEAR", msg, df, count)
+    except Exception as exc:
+        return _error(exc)
+
+# ---------------------------------------------------------------------------
+# Signal 17 — Device ID Reuse Across Companies
+# ---------------------------------------------------------------------------
+
+def check_device_id_reuse(company_id: int) -> Dict[str, Any]:
+    """
+    ALERT if the device ID used at signup for this company also appears in
+    signup records for other companies.
+
+    Sources:
+      Heap      : heap.sign_up_owner_signed_up  → heap_device_id (string), company_id (string)
+      Amplitude : dbt_staging.s_amp_owner_signups_raw → heap_id (string), company_id (bigint)
+
+    A shared device ID across multiple company signups strongly indicates
+    the same physical device was used to create multiple business accounts.
+    """
+    sql = f"""
+    WITH target_devices AS (
+        SELECT DISTINCT heap_device_id AS device_id
+        FROM {_IP_SIGNUP_TABLE}
+        WHERE company_id = '{company_id}'
+          AND heap_device_id IS NOT NULL
+          AND heap_device_id != ''
+
+        UNION
+
+        SELECT DISTINCT heap_id AS device_id
+        FROM {_AMPLITUDE_TABLE}
+        WHERE company_id = {company_id}
+          AND heap_id IS NOT NULL
+          AND heap_id != ''
+    ),
+    heap_matches AS (
+        SELECT DISTINCT
+            h.heap_device_id            AS device_id,
+            TRY_CAST(h.company_id AS BIGINT) AS other_company_id,
+            'heap'                      AS source,
+            h.ip                        AS signup_ip,
+            h.time                      AS signup_time
+        FROM {_IP_SIGNUP_TABLE} h
+        INNER JOIN target_devices td ON td.device_id = h.heap_device_id
+        WHERE h.company_id IS NOT NULL
+          AND h.company_id != ''
+          AND h.company_id != '{company_id}'
+    ),
+    amplitude_matches AS (
+        SELECT DISTINCT
+            a.heap_id                   AS device_id,
+            a.company_id                AS other_company_id,
+            'amplitude'                 AS source,
+            a.ip_address                AS signup_ip,
+            a.event_time                AS signup_time
+        FROM {_AMPLITUDE_TABLE} a
+        INNER JOIN target_devices td ON td.device_id = a.heap_id
+        WHERE a.company_id IS NOT NULL
+          AND a.company_id != {company_id}
+    ),
+    all_matches AS (
+        SELECT device_id, other_company_id, source, signup_ip, signup_time
+        FROM heap_matches
+        WHERE other_company_id IS NOT NULL
+        UNION
+        SELECT device_id, other_company_id, source, signup_ip, signup_time
+        FROM amplitude_matches
+    )
+    SELECT
+        am.device_id,
+        am.other_company_id,
+        co.name         AS other_company_name,
+        am.source,
+        am.signup_ip,
+        am.signup_time
+    FROM all_matches am
+    LEFT JOIN {_CO_TABLE} co ON co.company_id = am.other_company_id
+    ORDER BY am.signup_time DESC
+    LIMIT 100
+    """
+    try:
+        df    = run_query(sql)
+        count = len(df)
+        flagged = count > 0
+        if flagged:
+            n_devices  = df["device_id"].nunique()      if "device_id"       in df.columns else 0
+            n_companies = df["other_company_id"].nunique() if "other_company_id" in df.columns else 0
+            msg = (
+                f"{n_devices} device ID{'s' if n_devices != 1 else ''} matched across "
+                f"{n_companies} other {'companies' if n_companies != 1 else 'company'}"
+            )
+        else:
+            msg = "No shared device IDs detected across other companies"
         return _result("ALERT" if flagged else "CLEAR", msg, df, count)
     except Exception as exc:
         return _error(exc)
