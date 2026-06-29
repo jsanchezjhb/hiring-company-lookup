@@ -14,8 +14,6 @@ Status values:
 
 from __future__ import annotations
 
-import os
-import streamlit as st
 from typing import Any, Dict
 import pandas as pd
 
@@ -25,40 +23,26 @@ DATABRICKS_HOST      = "homebase-staging.cloud.databricks.com"
 DATABRICKS_HTTP_PATH = "/sql/1.0/warehouses/16984dfe9a2c3705"
 
 
-def _user_token() -> str:
-    try:
-        t = st.context.headers.get("X-Forwarded-Access-Token", "").strip()
-        if t:
-            return t
-    except AttributeError:
-        pass
-    return os.environ.get("DATABRICKS_TOKEN", "").strip()
-
-
-def run_query(sql_text: str) -> pd.DataFrame:
-    from databricks import sql as dbsql
-
-    token = _user_token()
-    if not token:
-        raise RuntimeError(
-            "No user token found. "
-            "Enable User Authorization in Apps → Edit → User Authorization."
-        )
-
 def run_query(sql_text: str) -> pd.DataFrame:
     from databricks.sdk.core import Config
     from databricks import sql as dbsql
 
-    # Exact pattern from the working billing-disputes app:
-    #   cfg = Config()  →  discovers DATABRICKS_CLIENT_ID + SECRET (OAuth M2M)
-    #   credentials_provider=lambda: cfg.authenticate  →  two-level Thrift auth
-    # User Authorization must be OFF so DATABRICKS_TOKEN is not injected
-    # alongside the OAuth credentials (that causes the "two auth methods" conflict).
-    cfg  = Config()
+    # OAuth M2M via the Databricks SDK. Config() discovers DATABRICKS_CLIENT_ID +
+    # DATABRICKS_CLIENT_SECRET (or, locally, ~/.databrickscfg / env vars).
+    #
+    # We pull a fresh bearer token from cfg.authenticate() and pass it as
+    # access_token=, rather than credentials_provider=. The credentials_provider
+    # interface is incompatible across newer databricks-sdk / databricks-sql-connector
+    # versions; the access_token path is stable across the bump to sdk>=0.81.0
+    # (this mirrors signal-scout-v2's signal_scout/data/databricks.py).
+    # User Authorization must stay OFF on the App so DATABRICKS_TOKEN is not
+    # injected alongside the OAuth credentials (that causes a "two auth methods" conflict).
+    cfg = Config()
+    access_token = cfg.authenticate().get("Authorization", "").removeprefix("Bearer ")
     conn = dbsql.connect(
         server_hostname=DATABRICKS_HOST,
         http_path=DATABRICKS_HTTP_PATH,
-        credentials_provider=lambda: cfg.authenticate,
+        access_token=access_token,
     )
     try:
         with conn.cursor() as cursor:
@@ -112,17 +96,27 @@ def _error(exc: Exception) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def get_company_info(company_id: int) -> pd.DataFrame:
-    """Fetch basic company metadata for the header card."""
+    """Fetch basic company metadata for the header card.
+
+    Uses postgres.companies (not public.companies) to avoid a Parquet
+    INT32/INT64 schema-drift error on the public.companies S3 files.
+    Location and employee counts are derived live from postgres tables.
+    """
     sql = f"""
     SELECT
-        c.company_id,
-        c.name                           AS company_name,
-        c.uuid                           AS company_uuid,
-        CAST(c.created_at AS DATE)       AS member_since,
-        COALESCE(c.employee_count, 0)    AS employee_count,
-        COALESCE(c.location_count, 0)    AS location_count
-    FROM public.companies c
-    WHERE c.company_id = {company_id}
+        c.id                                                AS company_id,
+        c.name                                              AS company_name,
+        CAST(c.created_at AS DATE)                          AS member_since,
+        COUNT(DISTINCT l.id)                                AS location_count,
+        COUNT(DISTINCT CASE WHEN j.archived_at IS NULL
+                            THEN j.user_id END)             AS employee_count
+    FROM prod_redshift_replica.postgres.companies c
+    LEFT JOIN prod_redshift_replica.postgres.locations l
+           ON l.company_id = c.id
+    LEFT JOIN prod_redshift_replica.postgres.jobs j
+           ON j.location_id = l.id
+    WHERE c.id = {company_id}
+    GROUP BY c.id, c.name, c.created_at
     """
     return run_query(sql)
 
@@ -144,17 +138,17 @@ def check_active_job_posts(company_id: int) -> Dict[str, Any]:
         hjr.status,
         CAST(hjr.created_at AS DATE)                    AS created_date,
         CAST(hjr.activated_at AS TIMESTAMP)             AS activated_at,
-        l.location_id,
+        l.id                                            AS location_id,
         l.name                                          AS location_name,
-        c.company_id
+        c.id                                            AS company_id
     FROM postgres.hiring_job_requests hjr
-    INNER JOIN public.locations  l ON l.location_id = hjr.location_id
-    INNER JOIN public.companies  c ON c.company_id  = l.company_id
-    WHERE c.company_id     = {company_id}
+    INNER JOIN postgres.locations  l ON l.id         = hjr.location_id
+    INNER JOIN postgres.companies  c ON c.id         = l.company_id
+    WHERE c.id             = {company_id}
         AND hjr.hiring_version = 2
         AND hjr.status         = 'active'
         AND hjr.activated_at   IS NOT NULL
-        {EXCLUDE_TEST_COMPANY}
+        AND c.id != 1987234
     ORDER BY hjr.activated_at DESC
     """
     try:
@@ -189,19 +183,19 @@ def check_rapid_postings(company_id: int) -> Dict[str, Any]:
             hjr.status,
             hjr.created_at,
             LAG(hjr.created_at) OVER (
-                PARTITION BY c.company_id
+                PARTITION BY c.id
                 ORDER BY hjr.created_at ASC
             )               AS prev_created_at,
-            l.location_id,
+            l.id            AS location_id,
             l.name          AS location_name
         FROM postgres.hiring_job_requests hjr
-        INNER JOIN public.locations  l ON l.location_id = hjr.location_id
-        INNER JOIN public.companies  c ON c.company_id  = l.company_id
-        WHERE c.company_id     = {company_id}
+        INNER JOIN postgres.locations  l ON l.id = hjr.location_id
+        INNER JOIN postgres.companies  c ON c.id = l.company_id
+        WHERE c.id             = {company_id}
             AND hjr.hiring_version = 2
             AND hjr.status        != 'draft'
             AND (hjr.activated_at IS NOT NULL OR hjr.flagged_at IS NOT NULL)
-            {EXCLUDE_TEST_COMPANY}
+            AND c.id != 1987234
     )
     SELECT
         job_post_id,
@@ -255,16 +249,16 @@ def check_hourly_burst(company_id: int) -> Dict[str, Any]:
             hjr.status,
             hjr.created_at                                   AS created_at,
             DATE_TRUNC('HOUR', hjr.created_at)               AS hour_bucket,
-            l.location_id,
+            l.id                                               AS location_id,
             l.name                                             AS location_name
         FROM postgres.hiring_job_requests hjr
-        INNER JOIN public.locations  l ON l.location_id = hjr.location_id
-        INNER JOIN public.companies  c ON c.company_id  = l.company_id
-        WHERE c.company_id     = {company_id}
+        INNER JOIN postgres.locations  l ON l.id = hjr.location_id
+        INNER JOIN postgres.companies  c ON c.id = l.company_id
+        WHERE c.id             = {company_id}
             AND hjr.hiring_version = 2
             AND hjr.status        != 'draft'
             AND (hjr.activated_at IS NOT NULL OR hjr.flagged_at IS NOT NULL)
-            {EXCLUDE_TEST_COMPANY}
+            AND c.id != 1987234
     ),
     flagged_hours AS (
         SELECT
@@ -320,13 +314,13 @@ def check_daily_burst(company_id: int) -> Dict[str, Any]:
             CAST(hjr.created_at AS DATE)    AS post_date,
             COUNT(*)                        AS jobs_posted
         FROM postgres.hiring_job_requests hjr
-        INNER JOIN public.locations l ON l.location_id = hjr.location_id
-        INNER JOIN public.companies c ON c.company_id  = l.company_id
-        WHERE c.company_id      = {company_id}
+        INNER JOIN postgres.locations l ON l.id = hjr.location_id
+        INNER JOIN postgres.companies c ON c.id = l.company_id
+        WHERE c.id              = {company_id}
           AND hjr.hiring_version = 2
           AND hjr.status        != 'draft'
           AND (hjr.activated_at IS NOT NULL OR hjr.flagged_at IS NOT NULL)
-          {EXCLUDE_TEST_COMPANY}
+          AND c.id != 1987234
         GROUP BY CAST(hjr.created_at AS DATE)
         HAVING COUNT(*) >= {THRESHOLD}
     )
@@ -337,18 +331,18 @@ def check_daily_burst(company_id: int) -> Dict[str, Any]:
         hjr.title   AS job_title,
         hjr.status,
         hjr.created_at,
-        l.location_id,
+        l.id        AS location_id,
         l.name      AS location_name
     FROM daily_counts dc
     JOIN postgres.hiring_job_requests hjr
       ON CAST(hjr.created_at AS DATE) = dc.post_date
-    INNER JOIN public.locations l ON l.location_id = hjr.location_id
-    INNER JOIN public.companies c ON c.company_id  = l.company_id
-    WHERE c.company_id      = {company_id}
+    INNER JOIN postgres.locations l ON l.id = hjr.location_id
+    INNER JOIN postgres.companies c ON c.id = l.company_id
+    WHERE c.id              = {company_id}
       AND hjr.hiring_version = 2
       AND hjr.status        != 'draft'
       AND (hjr.activated_at IS NOT NULL OR hjr.flagged_at IS NOT NULL)
-      {EXCLUDE_TEST_COMPANY}
+      AND c.id != 1987234
     ORDER BY dc.post_date DESC, hjr.created_at ASC
     """
     try:
@@ -642,20 +636,21 @@ def check_dormancy_reactivation(company_id: int) -> Dict[str, Any]:
         FROM signin_gaps sg
         JOIN postgres.hiring_job_requests hjr
           ON hjr.created_at >= sg.returned_at
-        INNER JOIN public.locations l ON l.location_id = hjr.location_id
-        INNER JOIN public.companies c ON c.company_id  = l.company_id
-        WHERE c.company_id      = {company_id}
+        INNER JOIN postgres.locations l ON l.id = hjr.location_id
+        INNER JOIN postgres.companies c ON c.id = l.company_id
+        WHERE c.id              = {company_id}
           AND hjr.hiring_version = 2
           AND hjr.status        != 'draft'
           AND (hjr.activated_at IS NOT NULL OR hjr.flagged_at IS NOT NULL)
-          {EXCLUDE_TEST_COMPANY}
+          AND c.id != 1987234
         GROUP BY sg.account_id, sg.dormant_since, sg.returned_at, sg.gap_days
     )
     SELECT
         account_id,
         dormant_since,
-        returned_at,
         gap_days,
+        returned_at,
+        DATEDIFF(first_post_after_return, returned_at) AS days_to_first_post,
         first_post_after_return
     FROM posts_after_return
     ORDER BY gap_days DESC
@@ -677,9 +672,6 @@ def check_dormancy_reactivation(company_id: int) -> Dict[str, Any]:
             f"and posted Hiring jobs"
         )
         return _result("ALERT", msg, df, count)
-    except Exception as exc:
-        return _error(exc)
-
     except Exception as exc:
         return _error(exc)
 
@@ -782,6 +774,7 @@ def check_billing_disputes(company_id: int) -> Dict[str, Any]:
         d.evidence_due_date
     FROM {_DISPUTE_TABLE} d
     INNER JOIN company_customers cc ON cc.stripe_customer = d.customer_id
+    WHERE d.created_at >= CURRENT_DATE - INTERVAL 6 MONTHS
     ORDER BY d.created_at DESC
     """
     try:
@@ -803,20 +796,41 @@ def check_billing_disputes(company_id: int) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def check_payment_method_changes(company_id: int) -> Dict[str, Any]:
-    """ALERT if the company has used more than 2 distinct payment methods."""
+    """ALERT if the company has used more than 2 distinct payment methods.
+
+    Groups by card fingerprint (not payment_method ID) so the same physical card
+    charged under multiple PM IDs counts as one method.
+
+    Fingerprint resolution order:
+      1. charge.payment_method_details card fingerprint (present on most charges)
+      2. payment_method.card fingerprint (catches older charges missing #1)
+      3. payment_method ID as fallback (non-card types: bank accounts, etc.)
+    """
     sql = f"""
     WITH {_company_customers_cte(company_id)}
     SELECT
-        c.payment_method                AS payment_method_id,
+        COALESCE(
+            GET_JSON_OBJECT(c.payment_method_details, '$.card.fingerprint'),
+            GET_JSON_OBJECT(pm.card, '$.fingerprint'),
+            c.payment_method
+        )                               AS payment_fingerprint,
+        COUNT(DISTINCT c.payment_method) AS distinct_pm_ids,
         COUNT(*)                        AS times_charged,
         ROUND(SUM(c.amount) / 100.0, 2) AS total_charged_usd,
         MIN(FROM_UNIXTIME(c.created))   AS first_used_at,
         MAX(FROM_UNIXTIME(c.created))   AS last_used_at
     FROM {_CHG_TABLE} c
     INNER JOIN company_customers cc ON cc.stripe_customer = c.customer
+    LEFT JOIN {_PM_TABLE} pm
+           ON pm.id = c.payment_method
+          AND pm.row_deleted_at IS NULL
     WHERE c.payment_method IS NOT NULL
       AND c.created >= UNIX_TIMESTAMP() - 15768000
-    GROUP BY c.payment_method
+    GROUP BY COALESCE(
+        GET_JSON_OBJECT(c.payment_method_details, '$.card.fingerprint'),
+        GET_JSON_OBJECT(pm.card, '$.fingerprint'),
+        c.payment_method
+    )
     ORDER BY first_used_at DESC
     """
     try:
@@ -845,35 +859,42 @@ def check_fingerprint_reuse(company_id: int) -> Dict[str, Any]:
     Checks three sources so saved-but-uncharged cards are also caught:
       1. customer_source.fingerprint     — legacy stored cards (direct column)
       2. payment_method.card fingerprint — PaymentMethod API cards (JSON)
-      3. charge payment_method_details   — historical charge fingerprints
+      3. charge payment_method_details   — historical charge fingerprints (6 months)
 
+    target_fps is capped at 25 fingerprints to prevent timeouts on customers with
+    large card histories. Finding any cross-company match is sufficient signal.
     row_deleted_at IS NULL filters active records in customer_source / payment_method.
-    Charge scan is limited to 6 months to avoid a full table scan.
     """
     sql = f"""
     WITH {_company_customers_cte(company_id)},
 
     target_fps AS (
-        SELECT DISTINCT fingerprint
-        FROM {_CUST_SRC_TABLE}
-        WHERE customer IN (SELECT stripe_customer FROM company_customers)
-          AND fingerprint IS NOT NULL
-          AND row_deleted_at IS NULL
+        -- Cap at 25 fingerprints to prevent timeouts on customers with large card histories.
+        -- Finding any cross-company match is sufficient signal; exhausting every fingerprint is not needed.
+        SELECT fingerprint FROM (
+            SELECT DISTINCT fingerprint
+            FROM {_CUST_SRC_TABLE}
+            WHERE customer IN (SELECT stripe_customer FROM company_customers)
+              AND fingerprint IS NOT NULL
+              AND row_deleted_at IS NULL
 
-        UNION
+            UNION
 
-        SELECT DISTINCT GET_JSON_OBJECT(card, '$.fingerprint') AS fingerprint
-        FROM {_PM_TABLE}
-        WHERE customer IN (SELECT stripe_customer FROM company_customers)
-          AND GET_JSON_OBJECT(card, '$.fingerprint') IS NOT NULL
-          AND row_deleted_at IS NULL
+            SELECT DISTINCT GET_JSON_OBJECT(card, '$.fingerprint') AS fingerprint
+            FROM {_PM_TABLE}
+            WHERE customer IN (SELECT stripe_customer FROM company_customers)
+              AND GET_JSON_OBJECT(card, '$.fingerprint') IS NOT NULL
+              AND row_deleted_at IS NULL
 
-        UNION
+            UNION
 
-        SELECT DISTINCT GET_JSON_OBJECT(payment_method_details, {_FINGERPRINT_PATH}) AS fingerprint
-        FROM {_CHG_TABLE}
-        WHERE customer IN (SELECT stripe_customer FROM company_customers)
-          AND GET_JSON_OBJECT(payment_method_details, {_FINGERPRINT_PATH}) IS NOT NULL
+            SELECT DISTINCT GET_JSON_OBJECT(payment_method_details, {_FINGERPRINT_PATH}) AS fingerprint
+            FROM {_CHG_TABLE}
+            WHERE customer IN (SELECT stripe_customer FROM company_customers)
+              AND GET_JSON_OBJECT(payment_method_details, {_FINGERPRINT_PATH}) IS NOT NULL
+              AND created >= UNIX_TIMESTAMP() - 15768000
+        ) _fp
+        LIMIT 25
     ),
 
     other_customers AS (
@@ -1180,21 +1201,6 @@ def check_suspicious_timecards(company_id: int) -> Dict[str, Any]:
         return _result("ALERT" if flagged else "CLEAR", msg, df if flagged else pd.DataFrame(), count)
     except Exception as exc:
         return _error(exc)
-        df    = run_query(tc_sql)
-        count = len(df)
-        flagged = count > THRESHOLD
-        if flagged:
-            msg = (
-                f"{count} manager-entered punch{'es' if count != 1 else ''} in the last 14 days "
-                f"— exceeds threshold of {THRESHOLD}"
-            )
-        elif count > 0:
-            msg = f"{count} manager-entered punch{'es' if count != 1 else ''} in the last 14 days — within normal range"
-        else:
-            msg = "No manager-entered punches in the last 14 days"
-        return _result("ALERT" if flagged else "CLEAR", msg, df if flagged else pd.DataFrame(), count)
-    except Exception as exc:
-        return _error(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1269,24 +1275,38 @@ def check_payment_method_on_file(company_id: int) -> Dict[str, Any]:
 
         UNION ALL
 
-        -- Accept any payment method type (card, us_bank_account, etc.)
         SELECT pm.customer, pm.id AS pm_id, pm.type AS pm_type
         FROM {_PM_TABLE} pm
         INNER JOIN company_customers cc ON cc.stripe_customer = pm.customer
         WHERE pm.row_deleted_at IS NULL
+    ),
+    charge_summary AS (
+        -- Pre-aggregate charges per customer to avoid a Cartesian product
+        -- when joining against stored_pms (which can have multiple rows per customer).
+        SELECT
+            c.customer,
+            COUNT(c.id)                                                AS total_charges,
+            SUM(CASE WHEN c.status = 'succeeded' THEN 1 ELSE 0 END)  AS successful_charges,
+            SUM(CASE WHEN c.status = 'failed'    THEN 1 ELSE 0 END)  AS failed_charges,
+            MIN(FROM_UNIXTIME(c.created))                              AS first_charge_at,
+            MAX(FROM_UNIXTIME(c.created))                              AS last_charge_at
+        FROM {_CHG_TABLE} c
+        INNER JOIN company_customers cc ON cc.stripe_customer = c.customer
+        GROUP BY c.customer
     )
     SELECT
         cc.stripe_customer,
-        COUNT(DISTINCT spm.pm_id)                                           AS payment_methods_count,
-        COUNT(c.id)                                                 AS total_charges,
-        SUM(CASE WHEN c.status = 'succeeded' THEN 1 ELSE 0 END)    AS successful_charges,
-        SUM(CASE WHEN c.status = 'failed'    THEN 1 ELSE 0 END)    AS failed_charges,
-        MIN(FROM_UNIXTIME(c.created))                               AS first_charge_at,
-        MAX(FROM_UNIXTIME(c.created))                               AS last_charge_at
+        COUNT(DISTINCT spm.pm_id)               AS payment_methods_count,
+        COALESCE(cs.total_charges, 0)           AS total_charges,
+        COALESCE(cs.successful_charges, 0)      AS successful_charges,
+        COALESCE(cs.failed_charges, 0)          AS failed_charges,
+        cs.first_charge_at,
+        cs.last_charge_at
     FROM company_customers cc
     LEFT JOIN stored_pms spm ON spm.customer = cc.stripe_customer
-    LEFT JOIN {_CHG_TABLE} c ON c.customer   = cc.stripe_customer
-    GROUP BY cc.stripe_customer
+    LEFT JOIN charge_summary cs ON cs.customer = cc.stripe_customer
+    GROUP BY cc.stripe_customer, cs.total_charges, cs.successful_charges,
+             cs.failed_charges, cs.first_charge_at, cs.last_charge_at
     """
     try:
         df = run_query(sql)
@@ -1791,3 +1811,66 @@ def check_account_change_ip(company_id: int) -> Dict[str, Any]:
         return _result("ALERT" if flagged else "CLEAR", msg, df, count)
     except Exception as exc:
         return _error(exc)
+
+
+# ---------------------------------------------------------------------------
+# RAVI — KYC research input assembly (owner)
+# ---------------------------------------------------------------------------
+
+def get_owner_kyc_input(company_id: int) -> Dict[str, Any]:
+    """Assemble the KYC research input for a company's OWNER.
+
+    Returns the field set the RAVI pipeline consumes (mirrors the input builders
+    in ravi_job/orchestrator.py): name, phone, email, company, company_website,
+    business_address, syndication_email.
+
+    The owner is postgres.companies.owner_id → postgres.accounts (same join the
+    account-change signals use). business_address is the company's primary
+    location. company_website / syndication_email are not reliably stored in the
+    warehouse, so they are left blank — the RAVI prompts fall back to web search
+    when a field is absent.
+
+    Returns an empty dict if the company / owner cannot be resolved.
+    """
+    sql = f"""
+    WITH owner AS (
+        SELECT
+            c.id   AS company_id,
+            c.name AS company,
+            TRIM(CONCAT(COALESCE(a.first_name, ''), ' ', COALESCE(a.last_name, ''))) AS name,
+            a.email AS email,
+            a.phone AS phone
+        FROM {_PG_CO_TABLE} c
+        JOIN {_ACCOUNTS_TABLE} a ON a.id = c.owner_id
+        WHERE c.id = {company_id}
+    ),
+    loc AS (
+        SELECT
+            l.company_id,
+            CONCAT_WS(', ',
+                NULLIF(l.address_1, ''),
+                NULLIF(l.city, ''),
+                NULLIF(l.state, ''),
+                NULLIF(l.zip, '')
+            ) AS business_address
+        FROM {_LOCS_TABLE} l
+        WHERE l.company_id = {company_id}
+        ORDER BY l.id
+        LIMIT 1
+    )
+    SELECT
+        o.name,
+        o.email,
+        o.phone,
+        o.company,
+        ''                                  AS company_website,
+        COALESCE(loc.business_address, '')  AS business_address,
+        ''                                  AS syndication_email
+    FROM owner o
+    LEFT JOIN loc ON loc.company_id = o.company_id
+    """
+    df = run_query(sql)
+    if df.empty:
+        return {}
+    row = df.iloc[0].to_dict()
+    return {k: ("" if v is None else str(v)).strip() for k, v in row.items()}
