@@ -1,6 +1,6 @@
 """
 queries.py — Fraud detection signal queries for the Hiring product.
-d
+
 Each signal function:
   - Takes a company_id (int)
   - Returns a result dict: { status, message, detail_df, alert_count }
